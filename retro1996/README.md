@@ -235,9 +235,3 @@ Put on some 1996 hits while you browse:
 - "Wonderwall" by Oasis  
 - "Killing Me Softly" by Fugees
 - "1979" by The Smashing Pumpkins
-
----
-
-**Retro1996**: Where every webpage loads like it's 1996 again.
-
-*Built with ❤️ for the internet we remember.*
