@@ -190,12 +190,14 @@ Retro1996 captures this spirit of creativity and exploration.
 ### System Requirements
 
 **Minimum**:
+- Windows 10/11
 - 1 GHz processor
 - 512 MB RAM
 - 100 MB disk space
 - Graphics card with 32 MB VRAM
 
 **Recommended**:
+- Windows 10/11
 - 2 GHz processor
 - 2 GB RAM
 - 500 MB disk space
@@ -203,18 +205,7 @@ Retro1996 captures this spirit of creativity and exploration.
 
 ### Community
 
-Join our community of retro computing fans:
-
-- **Discord**: [Retro1996 Community](https://discord.gg/retro1996)
-- **Forum**: [Retro Computing Discussion](https://retro1996.forum)
 - **GitHub**: [Issues and Discussions](https://github.com/retro1996/retro1996/issues)
-
-### News & Updates
-
-- **v3.0.0**: Major rewrite with solid architecture.
-- **v2.1.0**: Added HTTPS support and enhanced JavaScript engine.
-- **v2.0.0**: Complete UI redesign with authentic 1996 look.
-- **v1.0.0**: Initial release featuring basic HTML and image rendering.
 
 ### License
 
