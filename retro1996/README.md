@@ -203,10 +203,6 @@ Retro1996 captures this spirit of creativity and exploration.
 - 500 MB disk space
 - Graphics card with 128 MB VRAM
 
-### Community
-
-- **GitHub**: [Issues and Discussions](https://github.com/retro1996/retro1996/issues)
-
 ### License
 
 Retro1996 is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
