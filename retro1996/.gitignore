@@ -1,0 +1,11 @@
+# Rust build files
+/target
+
+# My private rules and prompts
+.clinerules/
+prompt3.md
+
+# Windows system clutter
+Thumbs.db
+.DS_Store
+*.exe

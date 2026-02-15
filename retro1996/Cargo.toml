@@ -1,0 +1,137 @@
+[package]
+name = "retro1996"
+version = "3.0.0"
+edition = "2021"
+description = "Retro1996 Browser - An authentic 1996-era web browser"
+authors = ["Retro1996 Project"]
+repository = "https://github.com/retro1996/retro1996"
+license = "MIT"
+
+[[bin]]
+name = "retro1996"
+path = "src/main.rs"
+
+[dependencies]
+# Core Rust ecosystem (available and mature by 1996 standards)
+chrono = "0.4"
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+anyhow = "1.0"
+once_cell = "1.18"
+lazy_static = "1.4"
+
+# UI (modern but necessary for current implementation)
+eframe = "0.26"
+egui = "0.26"
+
+# Image processing (complex algorithms, reasonable to use)
+image = "0.24"
+gif = "0.13"
+
+# Storage and configuration (1996 appropriate)
+ini = "1.3"
+directories = "5.0"
+
+# Audio (complex, reasonable to use)
+rodio = "0.17"
+
+# Compression (complex algorithms)
+flate2 = "1.0"
+zip = "0.6"
+
+# Text processing (complex)
+html-escape = "0.2"
+encoding_rs = "0.8"
+
+# Platform-specific (Windows 1996 era)
+winapi = { version = "0.3", features = ["winuser", "winbase", "handleapi", "processthreadsapi", "memoryapi", "sysinfoapi", "wincon", "shellapi", "winreg", "psapi", "fileapi", "minwindef", "winnt", "heapapi", "synchapi", "processenv", "libloaderapi", "errhandlingapi", "timezoneapi"] }
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Pipes",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Power",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+] }
+winreg = "0.52"
+
+# Dialog and utilities
+native-dialog = "0.7"
+walkdir = "2.3"
+
+# Collections and utilities
+bitflags = "2.4"
+bytemuck = "1.14"
+byteorder = "1.4"
+crc32fast = "1.3"
+libflate = "2.0"
+memchr = "2.5"
+smallvec = "1.10"
+arrayvec = "0.7"
+hashbrown = "0.14"
+indexmap = "2.0"
+
+# Threading and concurrency
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+num_cpus = "1.13"
+rayon = "1.7"
+crossbeam = "0.8"
+
+# Text processing
+unicode-segmentation = "1.10"
+unicode-normalization = "0.1.22"
+
+# System and platform
+libc = "0.2"
+getrandom = "0.2"
+digest = "0.10"
+subtle = "2.5"
+libm = "0.2"
+
+# More utilities
+uuid = { version = "1.0", features = ["v4"] }
+base64 = "0.21"
+time = "0.3"
+percent-encoding = "2.1"
+urlencoding = "2.1"
+mime_guess = "2.0"
+bincode = "1.3"
+half = "2.2"
+clap = { version = "4.0", features = ["derive"] }
+dirs = "5.0"
+tempfile = "3.0"
+hex = "0.4"
+rand = "0.8"
+zeroize = "1.6"
+slotmap = "1.0"
+bumpalo = "3.14"
+textwrap = "0.16"
+termcolor = "1.2"
+atty = "0.2"
+which = "4.4"
+indicatif = "0.17"
+dialoguer = "0.10"
+arboard = "3.2"
+notify = "6.1"
+backtrace = "0.3"
+itertools = "0.12"
+
+[build-dependencies]
+winres = "0.1"
