@@ -1,21 +1,23 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 use std::error::Error;
 use std::fmt;
-use std::str;
 
-/// 1996-Era SSL/TLS Support
+use native_tls::{TlsConnector, TlsStream};
+
+/// 1996-Era HTTPS Support
 /// 
-/// Basic SSL implementation suitable for 1996-era HTTPS support.
-/// Production-grade with proper error handling and certificate validation.
+/// Uses native-tls for TLS 1.0+ compatibility while maintaining 1996 authenticity
+/// in HTTP protocol (HTTP/1.0, period-authentic headers).
 /// 
-/// This provides HTTPS support while maintaining 1996 authenticity.
-#[derive(Debug, Clone)]
+/// Note: While modern TLS (1.2/1.3) is used for security, the HTTP layer
+/// maintains full 1996 authenticity with HTTP/1.0 protocol.
+#[derive(Debug)]
 pub struct SslConnection {
-    stream: TcpStream,
+    stream: TlsStream<TcpStream>,
     domain: String,
-    port: u16,
     connected: bool,
 }
 
@@ -43,137 +45,35 @@ impl fmt::Display for SslError {
 impl Error for SslError {}
 
 impl SslConnection {
-    /// Create a new SSL connection
+    /// Create a new SSL connection to the specified domain and port
     pub fn new(domain: &str, port: u16, timeout: Duration) -> Result<Self, SslError> {
-        // Connect to the server
+        // Connect to the server via TCP
         let addr = format!("{}:{}", domain, port);
-        let stream = TcpStream::connect(&addr)
+        let tcp_stream = TcpStream::connect(&addr)
             .map_err(|e| SslError::ConnectionFailed(format!("Failed to connect to {}: {}", addr, e)))?;
         
-        stream.set_read_timeout(Some(timeout))
+        tcp_stream.set_read_timeout(Some(timeout))
             .map_err(|e| SslError::IoError(format!("Failed to set read timeout: {}", e)))?;
-        stream.set_write_timeout(Some(timeout))
+        tcp_stream.set_write_timeout(Some(timeout))
             .map_err(|e| SslError::IoError(format!("Failed to set write timeout: {}", e)))?;
         
-        let mut ssl_conn = Self {
-            stream,
+        // Create TLS connector with appropriate settings for 1996 authenticity
+        // We use native-tls which will negotiate the best available TLS version
+        let connector = TlsConnector::builder()
+            .danger_accept_invalid_certs(false) // Security: validate certs
+            .danger_accept_invalid_hostnames(false) // Security: validate hostnames
+            .build()
+            .map_err(|e| SslError::HandshakeFailed(format!("Failed to create TLS connector: {}", e)))?;
+        
+        // Perform TLS handshake
+        let tls_stream = connector.connect(domain, tcp_stream)
+            .map_err(|e| SslError::HandshakeFailed(format!("TLS handshake failed: {}", e)))?;
+        
+        Ok(Self {
+            stream: tls_stream,
             domain: domain.to_string(),
-            port,
-            connected: false,
-        };
-        
-        // Perform SSL handshake
-        ssl_conn.handshake()?;
-        
-        Ok(ssl_conn)
-    }
-    
-    /// Perform SSL handshake (simplified for 1996 era)
-    fn handshake(&mut self) -> Result<(), SslError> {
-        // Send Client Hello
-        let client_hello = self.build_client_hello();
-        self.stream.write_all(&client_hello)
-            .map_err(|e| SslError::IoError(format!("Failed to send Client Hello: {}", e)))?;
-        
-        // Read Server Hello and Certificate
-        let mut buffer = [0; 4096];
-        let bytes_read = self.stream.read(&mut buffer)
-            .map_err(|e| SslError::IoError(format!("Failed to read server response: {}", e)))?;
-        
-        // Basic validation of server response
-        if bytes_read < 10 {
-            return Err(SslError::HandshakeFailed("Server response too short".to_string()));
-        }
-        
-        // For 1996 authenticity, we do basic certificate validation
-        // In 1996, SSL was much simpler and less strict
-        if !self.validate_certificate(&buffer[..bytes_read]) {
-            return Err(SslError::CertificateError("Certificate validation failed".to_string()));
-        }
-        
-        // Send Client Key Exchange (simplified)
-        let client_key_exchange = self.build_client_key_exchange();
-        self.stream.write_all(&client_key_exchange)
-            .map_err(|e| SslError::IoError(format!("Failed to send Client Key Exchange: {}", e)))?;
-        
-        self.connected = true;
-        Ok(())
-    }
-    
-    /// Build Client Hello message
-    fn build_client_hello(&self) -> Vec<u8> {
-        // Simplified SSL 3.0 Client Hello for 1996 authenticity
-        let mut hello = Vec::new();
-        
-        // SSL Record Header
-        hello.extend_from_slice(&[0x16, 0x03, 0x00]); // Content Type: Handshake, SSL 3.0
-        
-        // Handshake Protocol
-        hello.extend_from_slice(&[0x01]); // Handshake Type: Client Hello
-        hello.extend_from_slice(&[0x00, 0x00, 0x31]); // Length: 49 bytes
-        
-        // Protocol Version: SSL 3.0
-        hello.extend_from_slice(&[0x03, 0x00]);
-        
-        // Random (28 bytes of zeros for simplicity in 1996 style)
-        hello.extend_from_slice(&[0x00; 28]);
-        
-        // Session ID (empty)
-        hello.extend_from_slice(&[0x00]);
-        
-        // Cipher Suites (simplified list)
-        hello.extend_from_slice(&[
-            0x00, 0x04, // TLS_RSA_WITH_RC4_128_MD5
-            0x00, 0x05, // TLS_RSA_WITH_RC4_128_SHA
-            0x00, 0x0A, // TLS_RSA_WITH_3DES_EDE_CBC_SHA
-        ]);
-        
-        // Compression Methods (null only)
-        hello.extend_from_slice(&[0x01, 0x00]);
-        
-        hello
-    }
-    
-    /// Build Client Key Exchange
-    fn build_client_key_exchange(&self) -> Vec<u8> {
-        // Simplified Client Key Exchange
-        let mut key_exchange = Vec::new();
-        
-        // SSL Record Header
-        key_exchange.extend_from_slice(&[0x16, 0x03, 0x00]); // Content Type: Handshake, SSL 3.0
-        
-        // Change Cipher Spec
-        key_exchange.extend_from_slice(&[0x14, 0x03, 0x00, 0x00, 0x01, 0x01]);
-        
-        key_exchange
-    }
-    
-    /// Validate server certificate (basic validation for 1996)
-    fn validate_certificate(&self, response: &[u8]) -> bool {
-        // For 1996 authenticity, certificate validation was much simpler
-        // We'll do basic checks:
-        
-        // Check if response contains certificate data
-        if response.len() < 50 {
-            return false;
-        }
-        
-        // Check for certificate magic bytes (simplified)
-        // In 1996, SSL certificates were much simpler
-        let cert_marker = b"\x30\x82"; // DER encoded certificate marker
-        if !response.windows(cert_marker.len()).any(|window| window == cert_marker) {
-            return false;
-        }
-        
-        // Basic domain name check (simplified)
-        // In 1996, domain validation was not as strict
-        let domain_bytes = self.domain.as_bytes();
-        if response.windows(domain_bytes.len()).any(|window| window == domain_bytes) {
-            return true;
-        }
-        
-        // For 1996 authenticity, we're more permissive
-        true
+            connected: true,
+        })
     }
     
     /// Send data over SSL connection
@@ -182,8 +82,6 @@ impl SslConnection {
             return Err(SslError::ProtocolError("SSL connection not established".to_string()));
         }
         
-        // For 1996 authenticity, we'll do basic encryption simulation
-        // Real SSL would encrypt this, but for our purposes we'll just send it
         self.stream.write_all(data)
             .map_err(|e| SslError::IoError(format!("Failed to write data: {}", e)))?;
         
@@ -196,29 +94,23 @@ impl SslConnection {
             return Err(SslError::ProtocolError("SSL connection not established".to_string()));
         }
         
-        // For 1996 authenticity, we'll do basic decryption simulation
         self.stream.read(buffer)
             .map_err(|e| SslError::IoError(format!("Failed to read data: {}", e)))
-    }
-    
-    /// Get the underlying TCP stream for direct access
-    pub fn get_stream(&mut self) -> &mut TcpStream {
-        &mut self.stream
     }
     
     /// Close SSL connection
     pub fn close(mut self) -> Result<(), SslError> {
         if self.connected {
-            // Send close notify
-            let close_notify = [0x15, 0x03, 0x00, 0x00, 0x02, 0x00, 0x00];
-            self.stream.write_all(&close_notify)
-                .map_err(|e| SslError::IoError(format!("Failed to send close notify: {}", e)))?;
+            // TLS close notify is handled by Drop
+            self.connected = false;
         }
         Ok(())
     }
 }
 
 /// HTTPS client for 1996-era HTTPS support
+/// 
+/// Provides HTTPS support with HTTP/1.0 protocol and period-authentic headers.
 pub struct HttpsClient {
     user_agent: String,
     timeout: Duration,
@@ -227,7 +119,7 @@ pub struct HttpsClient {
 impl HttpsClient {
     pub fn new() -> Self {
         Self {
-            user_agent: "Retro1996/3.0 (Win95; I)".to_string(),
+            user_agent: "Mozilla/3.0 (compatible; Retro1996/3.0; Win95; I)".to_string(),
             timeout: Duration::from_secs(30),
         }
     }
@@ -243,22 +135,63 @@ impl HttpsClient {
     /// Fetch HTTPS URL with SSL support
     pub fn get(&self, url: &str) -> Result<HttpResponse, SslError> {
         // Parse URL
-        let (domain, port, path) = self.parse_url(url)?;
+        let (domain, port, path, query) = self.parse_url(url)?;
         
         // Create SSL connection
         let mut ssl_conn = SslConnection::new(&domain, port, self.timeout)?;
         
-        // Build HTTP request
-        let request = self.build_request("GET", &domain, &path);
+        // Build HTTP/1.0 request (period-authentic)
+        let request_path = if query.is_empty() {
+            path.clone()
+        } else {
+            format!("{}?{}", path, query)
+        };
+        let request = self.build_request("GET", &domain, &request_path);
         
         // Send request
         ssl_conn.write(request.as_bytes())
             .map_err(|e| SslError::IoError(format!("Failed to send request: {}", e)))?;
         
-        // Read response
-        let mut response_buffer = Vec::new();
-        let mut buffer = [0; 1024];
+        // Read full response
+        let (header_section, body) = self.read_full_response(&mut ssl_conn)?;
         
+        // Parse HTTP response
+        self.parse_response(&header_section, &body)
+    }
+    
+    /// POST to HTTPS URL with SSL support
+    pub fn post(&self, url: &str, post_body: &[u8], content_type: &str) -> Result<HttpResponse, SslError> {
+        // Parse URL
+        let (domain, port, path, query) = self.parse_url(url)?;
+        
+        // Create SSL connection
+        let mut ssl_conn = SslConnection::new(&domain, port, self.timeout)?;
+        
+        // Build HTTP/1.0 request (period-authentic)
+        let request_path = if query.is_empty() {
+            path.clone()
+        } else {
+            format!("{}?{}", path, query)
+        };
+        let request = self.build_post_request(&domain, &request_path, post_body, content_type);
+        
+        // Send request
+        ssl_conn.write(request.as_bytes())
+            .map_err(|e| SslError::IoError(format!("Failed to send request: {}", e)))?;
+        
+        // Read full response
+        let (header_section, body) = self.read_full_response(&mut ssl_conn)?;
+        
+        // Parse HTTP response
+        self.parse_response(&header_section, &body)
+    }
+    
+    /// Read full response from SSL connection
+    fn read_full_response(&self, ssl_conn: &mut SslConnection) -> Result<(String, Vec<u8>), SslError> {
+        let mut response_buffer = Vec::new();
+        let mut buffer = [0; 4096];
+        
+        // Read until we get the header terminator
         loop {
             let bytes_read = ssl_conn.read(&mut buffer)
                 .map_err(|e| SslError::IoError(format!("Failed to read response: {}", e)))?;
@@ -272,22 +205,53 @@ impl HttpsClient {
             }
         }
         
-        // Parse HTTP response
-        self.parse_response(&response_buffer)
+        // Find header/body boundary
+        let header_end = response_buffer.windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or_else(|| SslError::ProtocolError("No header terminator found".to_string()))?;
+        
+        // Extract header section as string
+        let header_section = String::from_utf8_lossy(&response_buffer[..header_end]).to_string();
+        
+        // Get any body data that came with the headers
+        let mut body = if response_buffer.len() > header_end + 4 {
+            response_buffer[header_end + 4..].to_vec()
+        } else {
+            Vec::new()
+        };
+        
+        // Continue reading the rest of the body until connection closes
+        // (HTTP/1.0 with Connection: close)
+        loop {
+            let bytes_read = ssl_conn.read(&mut buffer)
+                .map_err(|e| SslError::IoError(format!("Failed to read response body: {}", e)))?;
+            if bytes_read == 0 {
+                break; // Connection closed by server
+            }
+            body.extend_from_slice(&buffer[..bytes_read]);
+        }
+        
+        Ok((header_section, body))
     }
     
     /// Parse HTTPS URL
-    fn parse_url(&self, url: &str) -> Result<(String, u16, String), SslError> {
+    fn parse_url(&self, url: &str) -> Result<(String, u16, String, String), SslError> {
         if !url.starts_with("https://") {
             return Err(SslError::ProtocolError("URL must start with https://".to_string()));
         }
         
         let url_no_scheme = &url[8..]; // Remove "https://"
         
-        let (domain_port, path) = if let Some(slash_pos) = url_no_scheme.find('/') {
+        let (domain_port, path_query) = if let Some(slash_pos) = url_no_scheme.find('/') {
             (&url_no_scheme[..slash_pos], &url_no_scheme[slash_pos..])
         } else {
             (url_no_scheme, "/")
+        };
+        
+        let (path, query) = if let Some(qmark_pos) = path_query.find('?') {
+            (&path_query[..qmark_pos], &path_query[qmark_pos + 1..])
+        } else {
+            (path_query, "")
         };
         
         let (domain, port) = if let Some(colon_pos) = domain_port.find(':') {
@@ -299,15 +263,16 @@ impl HttpsClient {
             (domain_port.to_string(), 443) // HTTPS default port
         };
         
-        Ok((domain, port, path.to_string()))
+        Ok((domain, port, path.to_string(), query.to_string()))
     }
     
-    /// Build HTTP request
+    /// Build HTTP/1.0 GET request (period-authentic)
     fn build_request(&self, method: &str, domain: &str, path: &str) -> String {
         format!(
             "{} {} HTTP/1.0\r\n\
              Host: {}\r\n\
              User-Agent: {}\r\n\
+             Accept: */*\r\n\
              Connection: close\r\n\
              \r\n",
             method,
@@ -317,19 +282,35 @@ impl HttpsClient {
         )
     }
     
-    /// Parse HTTP response
-    fn parse_response(&self, response_data: &[u8]) -> Result<HttpResponse, SslError> {
-        let response_str = String::from_utf8_lossy(response_data);
-        let parts: Vec<&str> = response_str.split("\r\n\r\n").collect();
+    /// Build HTTP/1.0 POST request (period-authentic)
+    fn build_post_request(&self, domain: &str, path: &str, body: &[u8], content_type: &str) -> String {
+        let mut request = format!(
+            "POST {} HTTP/1.0\r\n\
+             Host: {}\r\n\
+             User-Agent: {}\r\n\
+             Content-Type: {}\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            path,
+            domain,
+            self.user_agent,
+            content_type,
+            body.len()
+        );
         
-        if parts.is_empty() {
-            return Err(SslError::ProtocolError("Empty response".to_string()));
+        // Append body
+        if let Ok(body_str) = std::str::from_utf8(body) {
+            request.push_str(body_str);
         }
         
-        let header_section = parts[0];
-        let body = if parts.len() > 1 { parts[1].as_bytes().to_vec() } else { Vec::new() };
-        
+        request
+    }
+    
+    /// Parse HTTP response
+    fn parse_response(&self, header_section: &str, body: &[u8]) -> Result<HttpResponse, SslError> {
         let header_lines: Vec<&str> = header_section.lines().collect();
+        
         if header_lines.is_empty() {
             return Err(SslError::ProtocolError("No status line".to_string()));
         }
@@ -345,7 +326,7 @@ impl HttpsClient {
             .map_err(|_| SslError::ProtocolError("Invalid status code".to_string()))?;
         let status_text = status_parts.get(2..).unwrap_or(&[]).join(" ");
         
-        let mut headers = std::collections::HashMap::new();
+        let mut headers = HashMap::new();
         for line in header_lines.iter().skip(1) {
             if let Some(pos) = line.find(':') {
                 let key = line[..pos].trim().to_lowercase();
@@ -358,7 +339,7 @@ impl HttpsClient {
         response.status_code = status_code;
         response.status_text = status_text;
         response.headers = headers;
-        response.body = body;
+        response.body = body.to_vec();
         
         // Extract specific headers
         response.content_type = response.headers.get("content-type").cloned();
@@ -376,12 +357,18 @@ impl HttpsClient {
     }
 }
 
-/// HTTP response structure (reusing from network.rs)
+impl Default for HttpsClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// HTTP response structure
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status_code: u16,
     pub status_text: String,
-    pub headers: std::collections::HashMap<String, String>,
+    pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
     pub content_type: Option<String>,
     pub content_length: Option<usize>,
@@ -400,7 +387,7 @@ impl HttpResponse {
         Self {
             status_code: 0,
             status_text: String::new(),
-            headers: std::collections::HashMap::new(),
+            headers: HashMap::new(),
             body: Vec::new(),
             content_type: None,
             content_length: None,
@@ -436,6 +423,12 @@ impl HttpResponse {
     }
 }
 
+impl Default for HttpResponse {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,16 +444,18 @@ mod tests {
         let client = HttpsClient::new();
         
         // Test basic HTTPS URL
-        let (domain, port, path) = client.parse_url("https://example.com/path").unwrap();
+        let (domain, port, path, query) = client.parse_url("https://example.com/path").unwrap();
         assert_eq!(domain, "example.com");
         assert_eq!(port, 443);
         assert_eq!(path, "/path");
+        assert_eq!(query, "");
         
         // Test HTTPS URL with port
-        let (domain, port, path) = client.parse_url("https://example.com:8443/path").unwrap();
+        let (domain, port, path, query) = client.parse_url("https://example.com:8443/path?foo=bar").unwrap();
         assert_eq!(domain, "example.com");
         assert_eq!(port, 8443);
         assert_eq!(path, "/path");
+        assert_eq!(query, "foo=bar");
     }
     
     #[test]
@@ -470,6 +465,20 @@ mod tests {
         
         assert!(request.contains("GET /test HTTP/1.0"));
         assert!(request.contains("Host: example.com"));
-        assert!(request.contains("User-Agent: Retro1996/3.0 (Win95; I)"));
+        assert!(request.contains("User-Agent: Mozilla/3.0 (compatible; Retro1996/3.0; Win95; I)"));
+    }
+    
+    #[test]
+    fn test_http_response() {
+        let mut response = HttpResponse::new();
+        response.status_code = 200;
+        
+        assert!(response.is_success());
+        assert!(!response.is_redirect());
+        assert!(!response.is_client_error());
+        assert!(!response.is_server_error());
+        
+        response.status_code = 404;
+        assert!(response.is_client_error());
     }
 }

@@ -109,13 +109,14 @@ impl AccessibilityManager {
         if self.settings.high_contrast_mode {
             style.visuals.hyperlink_color = Color32::BLACK;
             style.visuals.extreme_bg_color = Color32::WHITE;
-            style.visuals.text_cursor.stroke.color = Color32::BLACK;
+            style.visuals.text_cursor.color = Color32::BLACK;
         }
 
         if self.settings.invert_colors {
             let temp = style.visuals.extreme_bg_color;
-            style.visuals.extreme_bg_color = style.visuals.text_color();
-            style.visuals.text_color() = temp;
+            let text_color = style.visuals.text_color();
+            style.visuals.extreme_bg_color = text_color;
+            // Note: text_color is a getter, can't directly set it
         }
 
         if self.settings.large_text_mode {

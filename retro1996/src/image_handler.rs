@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use image::{ImageFormat, RgbaImage};
+use image::{ImageFormat, RgbaImage, GenericImageView};
 use crate::animation::{Animation, AnimationType, AnimationFrame};
 
 #[derive(Debug, Clone)]

@@ -1,42 +1,46 @@
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
-use std::io::Write;
-use std::thread;
-use std::time::Duration;
-
 // Import the engine components
+#![windows_subsystem = "windows"]
+
 mod engine;
 mod network;
 mod ui;
 mod javascript_engine;
 
-use engine::{TrussCore, EngineConfig, RenderingMode, DisplayList};
-use network::{NetworkManager, HttpResponse};
-use ui::Retro1996Browser;
+use engine::{TrussCore, EngineConfig, RenderingMode};
+use network::NetworkManager;
 use javascript_engine::ChronoScript;
+use ui::Retro1996Browser;
 
 fn main() {
-    println!("Retro1996 Browser - TrussCore Engine");
-    println!("====================================");
+    // Set up panic hook to handle crashes gracefully without showing console
+    std::panic::set_hook(Box::new(|info| {
+        // Log the panic to a file instead of stderr to avoid console window
+        let _ = std::fs::write("retro1996_crash.log", format!("PANIC: {}", info));
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }));
     
     // Initialize core components
-    let trusscore = TrussCore::new();
-    let js_engine = ChronoScript::new();
-    let network = NetworkManager::new();
+    let mut trusscore = TrussCore::new();
+    let mut js_engine = ChronoScript::new();
+    let mut network = match NetworkManager::new() {
+        Ok(n) => n,
+        Err(e) => {
+            // Log error to file instead of printing to console
+            let _ = std::fs::write("retro1996_error.log", format!("Failed to initialize network manager: {}", e));
+            return;
+        }
+    };
     
     // Configure the engine for 1996-era rendering
     let mut config = EngineConfig::default();
     config.rendering_mode = RenderingMode::Netscape3;
     config.authentic_mode = true;
-    config.modern_scaling = false;  // Disable modern scaling for authentic 1996 experience
-    config.smoothing = false;       // Disable anti-aliasing
+    config.modern_scaling = false;
+    config.smoothing = false;
     config.emulate_800x600_viewport = true;
     config.enable_javascript = true;
     config.enable_images = true;
-    config.enable_plugins = false;  // Disable plugins for now
+    config.enable_plugins = false;
     config.progressive_rendering = true;
     config.web_safe_palette = true;
     
@@ -45,96 +49,64 @@ fn main() {
     
     // Load the welcome page
     let welcome_html = match std::fs::read_to_string("assets/welcome.html") {
-        Ok(html) => {
-            println!("Loading welcome page from assets/welcome.html");
-            html
-        }
-        Err(_) => {
-            println!("Welcome page file not found, using embedded welcome page");
-            r#"
-                <!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
-                <html>
-                <head>
-                    <title>Welcome to Retro1996</title>
-                    <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
-                </head>
-                <body bgcolor="#FFFFFF" text="#000000" link="#0000FF" vlink="#800080" alink="#FF0000">
-                    <center>
-                        <h1><font color="#000080" size="7">Retro1996 Browser v3.0</font></h1>
-                        <h2><font color="#000080" size="5">TrussCore Rendering Engine</font></h2>
-                        <h2><font color="#000080" size="5">ChronoScript JavaScript Engine</font></h2>
-                        <hr width="80%">
-                        <p><font size="4">Welcome to the Retro1996 Browser!</font></p>
-                        <p><font size="4">This browser simulates the web browsing experience from 1996.</font></p>
-                        <hr width="80%">
-                        <p><a href="http://example.com">Visit Example.com</a></p>
-                        <p><a href="ftp://ftp.example.com">Browse FTP Archive</a></p>
-                        <p><a href="gopher://gopher.example.com">Explore Gopher</a></p>
-                        <hr width="80%">
-                        <p><font size="2">Copyright &copy; 1996 Retro1996 Project</font></p>
-                    </center>
-                </body>
-                </html>
-            "#.to_string()
-        }
+        Ok(html) => html,
+        Err(_) => get_embedded_welcome_page()
     };
     
-    println!("Loading welcome page...");
     trusscore.load_html(&welcome_html);
     
     // Render the page
-    println!("Rendering page...");
     let display_list = trusscore.render(800.0);
-    
-    println!("Display list generated with {} commands", display_list.commands.len());
+    let _cmd_count = display_list.commands.len();
     
     // Test JavaScript execution
-    println!("Testing JavaScript engine...");
-    let js_result = js_engine.execute("var x = 5; var y = 10; x + y;");
-    match js_result {
-        Ok(_) => println!("JavaScript execution successful"),
-        Err(e) => println!("JavaScript error: {}", e),
-    }
+    let js_code = b"var x = 5; var y = 10; x + y;";
+    let _js_result = js_engine.execute(js_code);
     
     // Test network functionality
-    println!("Testing network manager...");
     let test_url = "http://example.com";
-    match network.fetch(test_url) {
-        Ok(response) => {
-            println!("Network fetch successful, got {} bytes", response.body.len());
-        }
-        Err(e) => {
-            println!("Network error: {}", e);
-        }
-    }
+    let _network_result = network.fetch(test_url);
     
-    println!("Retro1996 Browser initialization complete!");
-    println!("Engine is ready to render web pages from 1996.");
-    
-    // Keep the application running
-    println!("Starting main loop...");
-    let start_time = Instant::now();
-    
-    loop {
-        thread::sleep(Duration::from_millis(1000));
-        
-        // Update animations if any
-        trusscore.update_animated_gifs();
-        
-        // Update blink elements if any
-        if trusscore.has_blink_elements() {
-            trusscore.update_blink_state();
-        }
-        
-        // Update marquee elements if any
-        if trusscore.has_marquee_elements() {
-            trusscore.update_marquee_positions(0.1);
-        }
-        
-        // Show progress
-        let elapsed = start_time.elapsed().as_secs();
-        if elapsed % 10 == 0 {
-            println!("Running for {} seconds...", elapsed);
-        }
-    }
+    // Launch the egui window
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Retro1996 Browser")
+            .with_inner_size([800.0, 600.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Retro1996 Browser",
+        native_options,
+        Box::new(move |cc| {
+            Box::new(Retro1996Browser::new(cc, trusscore, js_engine, network).unwrap())
+        }),
+    ).unwrap();
+}
+
+fn get_embedded_welcome_page() -> String {
+    let html = "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n";
+    let html = html.to_string() + "<html>\n";
+    let html = html + "<head>\n";
+    let html = html + "<title>Welcome to Retro1996</title>\n";
+    let html = html + "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=iso-8859-1\">\n";
+    let html = html + "</head>\n";
+    let html = html + "<body bgcolor=\"#FFFFFF\" text=\"#000000\" link=\"#0000FF\" vlink=\"#800080\" alink=\"#FF0000\">\n";
+    let html = html + "<center>\n";
+    let html = html + "<h1><font color=\"#000080\" size=\"7\">Retro1996 Browser v3.0</font></h1>\n";
+    let html = html + "<h2><font color=\"#000080\" size=\"5\">TrussCore Rendering Engine</font></h2>\n";
+    let html = html + "<h2><font color=\"#000080\" size=\"5\">ChronoScript JavaScript Engine</font></h2>\n";
+    let html = html + "<hr width=\"80%\">\n";
+    let html = html + "<p><font size=\"4\">Welcome to the Retro1996 Browser!</font></p>\n";
+    let html = html + "<p><font size=\"4\">This browser simulates the web browsing experience from 1996.</font></p>\n";
+    let html = html + "<hr width=\"80%\">\n";
+    let html = html + "<p><a href=\"http://example.com\">Visit Example.com</a></p>\n";
+    let html = html + "<p><a href=\"ftp://ftp.example.com\">Browse FTP Archive</a></p>\n";
+    let html = html + "<p><a href=\"gopher://gopher.example.com\">Explore Gopher</a></p>\n";
+    let html = html + "<hr width=\"80%\">\n";
+    let html = html + "<p><font size=\"2\">Copyright &copy; 1996 Retro1996 Project</font></p>\n";
+    let html = html + "</center>\n";
+    let html = html + "</body>\n";
+    let html = html + "</html>\n";
+    html
 }

@@ -1,43 +1,67 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, SocketAddr};
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::str;
-use std::sync::mpsc;
 use std::fs;
 use std::path::Path;
 use std::error::Error;
 use std::fmt;
-use std::convert::TryInto;
-use std::cell::RefCell;
 
 use url::Url;
-use chrono::{Utc, TimeZone, NaiveDateTime};
+use chrono::{Utc, NaiveDateTime};
 use serde::{Serialize, Deserialize};
 use serde_json;
 
-#[cfg(windows)]
-use winapi::um::winsock2;
-#[cfg(windows)]
-use winapi::um::wininet;
-#[cfg(windows)]
-use winapi::um::wininetapi;
-#[cfg(windows)]
-use winapi::um::winbase;
-#[cfg(windows)]
-use winapi::um::winnt;
-#[cfg(windows)]
-use winapi::um::winerror;
-#[cfg(windows)]
-use winapi::shared::minwindef::{BOOL, DWORD, LPVOID, TRUE, FALSE};
-#[cfg(windows)]
-use winapi::shared::winerror::{ERROR_SUCCESS, ERROR_INTERNET_TIMEOUT, ERROR_INTERNET_CONNECTION_RESET};
-#[cfg(windows)]
-use winapi::shared::ws2def::{AF_INET, SOCK_STREAM, IPPROTO_TCP};
-#[cfg(windows)]
-use winapi::shared::ws2ipdef::SOCKADDR_IN;
+/// Proxy configuration for HTTP requests
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub proxy_type: ProxyType,
+    pub bypass_hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ProxyType {
+    Http,
+    Https,
+    Socks4,
+    Socks5,
+}
+
+impl ProxyConfig {
+    pub fn new(host: String, port: u16, proxy_type: ProxyType) -> Self {
+        Self {
+            host,
+            port,
+            username: None,
+            password: None,
+            proxy_type,
+            bypass_hosts: Vec::new(),
+        }
+    }
+    
+    pub fn with_auth(mut self, username: String, password: String) -> Self {
+        self.username = Some(username);
+        self.password = Some(password);
+        self
+    }
+    
+    pub fn add_bypass_host(mut self, host: String) -> Self {
+        self.bypass_hosts.push(host);
+        self
+    }
+    
+    pub fn should_bypass(&self, host: &str) -> bool {
+        self.bypass_hosts.iter().any(|bypass| {
+            host.ends_with(bypass) || host == bypass
+        })
+    }
+}
 
 /// Network error types for comprehensive error handling
 #[derive(Debug, Clone)]
@@ -223,16 +247,21 @@ impl HttpCache {
         // Check max-age directive
         if let Some(cache_control) = &entry.response.cache_control {
             if let Some(max_age) = self.parse_max_age(cache_control) {
-                let created = NaiveDateTime::parse_from_str(&entry.created_at, "%Y-%m-%dT%H:%M:%S%.fZ").ok()?;
-                let now = Utc::now().naive_utc();
-                return now.signed_duration_since(created).num_seconds() < max_age as i64;
+                if let Ok(created) = NaiveDateTime::parse_from_str(&entry.created_at, "%Y-%m-%dT%H:%M:%S%.fZ") {
+                    let now = Utc::now().naive_utc();
+                    return now.signed_duration_since(created).num_seconds() < max_age as i64;
+                }
             }
         }
         
         // Default freshness lifetime
-        let created = NaiveDateTime::parse_from_str(&entry.created_at, "%Y-%m-%dT%H:%M:%S%.fZ").ok()?;
-        let now = Utc::now().naive_utc();
-        now.signed_duration_since(created) < self.max_age
+        if let Ok(created) = NaiveDateTime::parse_from_str(&entry.created_at, "%Y-%m-%dT%H:%M:%S%.fZ") {
+            let now = Utc::now().naive_utc();
+            let duration = chrono::Duration::from_std(self.max_age).unwrap_or_else(|_| chrono::Duration::seconds(3600));
+            return now.signed_duration_since(created) < duration;
+        }
+        
+        false
     }
     
     fn calculate_expires(&self, response: &HttpResponse) -> Option<String> {
@@ -262,12 +291,12 @@ impl HttpCache {
     
     fn evict_lru(&self, entries: &mut HashMap<String, CacheEntry>) {
         let mut oldest_url = None;
-        let mut oldest_time = chrono::Utc::now();
+        let mut oldest_time: Option<NaiveDateTime> = None;
         
         for (url, entry) in entries.iter() {
             if let Ok(created) = NaiveDateTime::parse_from_str(&entry.created_at, "%Y-%m-%dT%H:%M:%S%.fZ") {
-                if created < oldest_time {
-                    oldest_time = created;
+                if oldest_time.is_none() || created < oldest_time.unwrap() {
+                    oldest_time = Some(created);
                     oldest_url = Some(url.clone());
                 }
             }
@@ -365,151 +394,6 @@ impl ConnectionPool {
     }
 }
 
-/// Windows-optimized socket operations
-#[cfg(windows)]
-pub struct Win32Socket {
-    socket: winapi::shared::winsock2::SOCKET,
-    connected: bool,
-}
-
-#[cfg(windows)]
-impl Win32Socket {
-    pub fn new() -> Result<Self, NetworkError> {
-        unsafe {
-            let wsadata = winapi::um::winsock2::WSADATA {
-                wVersion: 2,
-                wHighVersion: 2,
-                szDescription: [0; 256],
-                szSystemStatus: [0; 128],
-                iMaxSockets: 0,
-                iMaxUdpDg: 0,
-                lpVendorInfo: std::ptr::null_mut(),
-            };
-            
-            let result = winapi::um::winsock2::WSAStartup(0x0202, &wsadata as *const _ as *mut _);
-            if result != 0 {
-                return Err(NetworkError::Win32Error(format!("WSAStartup failed with error: {}", result)));
-            }
-            
-            let socket = winapi::um::winsock2::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if socket == winapi::um::winsock2::INVALID_SOCKET {
-                return Err(NetworkError::Win32Error("Failed to create socket".to_string()));
-            }
-            
-            Ok(Self {
-                socket,
-                connected: false,
-            })
-        }
-    }
-    
-    pub fn connect(&mut self, addr: &SocketAddr) -> Result<(), NetworkError> {
-        unsafe {
-            let sockaddr_in = SOCKADDR_IN {
-                sin_family: AF_INET as u16,
-                sin_port: addr.port().to_be(),
-                sin_addr: winapi::shared::inaddr::IN_ADDR {
-                    S_un: winapi::shared::inaddr::IN_ADDR_0 {
-                        S_addr: u32::from_be_bytes(addr.ip().octets()),
-                    },
-                },
-                sin_zero: [0; 8],
-            };
-            
-            let result = winapi::um::winsock2::connect(
-                self.socket,
-                &sockaddr_in as *const _ as *const winapi::shared::ws2def::sockaddr,
-                std::mem::size_of::<SOCKADDR_IN>() as i32,
-            );
-            
-            if result == 0 {
-                self.connected = true;
-                Ok(())
-            } else {
-                Err(NetworkError::Win32Error("Failed to connect".to_string()))
-            }
-        }
-    }
-    
-    pub fn send(&self, data: &[u8]) -> Result<usize, NetworkError> {
-        if !self.connected {
-            return Err(NetworkError::Win32Error("Socket not connected".to_string()));
-        }
-        
-        unsafe {
-            let result = winapi::um::winsock2::send(
-                self.socket,
-                data.as_ptr() as *const i8,
-                data.len() as i32,
-                0,
-            );
-            
-            if result >= 0 {
-                Ok(result as usize)
-            } else {
-                Err(NetworkError::Win32Error("Send failed".to_string()))
-            }
-        }
-    }
-    
-    pub fn receive(&self, buffer: &mut [u8]) -> Result<usize, NetworkError> {
-        if !self.connected {
-            return Err(NetworkError::Win32Error("Socket not connected".to_string()));
-        }
-        
-        unsafe {
-            let result = winapi::um::winsock2::recv(
-                self.socket,
-                buffer.as_mut_ptr() as *mut i8,
-                buffer.len() as i32,
-                0,
-            );
-            
-            if result >= 0 {
-                Ok(result as usize)
-            } else {
-                Err(NetworkError::Win32Error("Receive failed".to_string()))
-            }
-        }
-    }
-    
-    pub fn close(&mut self) {
-        if self.connected {
-            unsafe {
-                winapi::um::winsock2::closesocket(self.socket);
-                winapi::um::winsock2::WSACleanup();
-            }
-            self.connected = false;
-        }
-    }
-}
-
-#[cfg(not(windows))]
-pub struct Win32Socket {
-    _phantom: std::marker::PhantomData<()>,
-}
-
-#[cfg(not(windows))]
-impl Win32Socket {
-    pub fn new() -> Result<Self, NetworkError> {
-        Ok(Self { _phantom: std::marker::PhantomData })
-    }
-    
-    pub fn connect(&mut self, _addr: &SocketAddr) -> Result<(), NetworkError> {
-        Err(NetworkError::Win32Error("Win32Socket only available on Windows".to_string()))
-    }
-    
-    pub fn send(&self, _data: &[u8]) -> Result<usize, NetworkError> {
-        Err(NetworkError::Win32Error("Win32Socket only available on Windows".to_string()))
-    }
-    
-    pub fn receive(&self, _buffer: &mut [u8]) -> Result<usize, NetworkError> {
-        Err(NetworkError::Win32Error("Win32Socket only available on Windows".to_string()))
-    }
-    
-    pub fn close(&mut self) {}
-}
-
 /// HTTP client with connection pooling and caching
 pub struct HttpClient {
     user_agent: String,
@@ -519,6 +403,7 @@ pub struct HttpClient {
     keep_alive: bool,
     max_redirects: usize,
     dns_cache: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    proxy_config: Option<ProxyConfig>,
 }
 
 impl HttpClient {
@@ -533,6 +418,7 @@ impl HttpClient {
             keep_alive: true,
             max_redirects: 5,
             dns_cache: Arc::new(RwLock::new(HashMap::new())),
+            proxy_config: None,
         })
     }
     
@@ -550,6 +436,22 @@ impl HttpClient {
     
     pub fn set_max_redirects(&mut self, max_redirects: usize) {
         self.max_redirects = max_redirects;
+    }
+    
+    pub fn set_proxy(&mut self, proxy_config: ProxyConfig) {
+        self.proxy_config = Some(proxy_config);
+    }
+    
+    pub fn clear_proxy(&mut self) {
+        self.proxy_config = None;
+    }
+    
+    fn should_use_proxy(&self, host: &str) -> bool {
+        if let Some(proxy) = &self.proxy_config {
+            !proxy.should_bypass(host)
+        } else {
+            false
+        }
     }
     
     pub fn get(&self, url: &str) -> Result<HttpResponse, NetworkError> {
@@ -622,9 +524,11 @@ impl HttpClient {
         
         stream.write_all(request.as_bytes()).map_err(|e| NetworkError::IoError(format!("Failed to send request: {}", e)))?;
         
+        // Read the full response - headers first, then body
         let mut response_buffer = Vec::new();
-        let mut buffer = [0; 1024];
+        let mut buffer = [0; 4096];
         
+        // Read until we get the header terminator
         loop {
             let bytes_read = stream.read(&mut buffer).map_err(|e| NetworkError::IoError(format!("Failed to read response: {}", e)))?;
             if bytes_read == 0 {
@@ -637,7 +541,30 @@ impl HttpClient {
             }
         }
         
-        let response = self.parse_response(&response_buffer)?;
+        // Find header/body boundary
+        let header_end = response_buffer.windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or_else(|| NetworkError::ParseError("No header terminator found".to_string()))?;
+        
+        // Get any body data that came with the headers
+        let mut body = if response_buffer.len() > header_end + 4 {
+            response_buffer[header_end + 4..].to_vec()
+        } else {
+            Vec::new()
+        };
+        
+        // Continue reading the rest of the body until connection closes
+        // (HTTP/1.0 with Connection: close, or HTTP/1.1 until Content-Length satisfied)
+        loop {
+            let bytes_read = stream.read(&mut buffer).map_err(|e| NetworkError::IoError(format!("Failed to read response body: {}", e)))?;
+            if bytes_read == 0 {
+                break; // Connection closed by server
+            }
+            body.extend_from_slice(&buffer[..bytes_read]);
+        }
+        
+        let header_section = String::from_utf8_lossy(&response_buffer[..header_end]).to_string();
+        let response = self.parse_response_from_parts(&header_section, &body)?;
         
         if self.keep_alive && response.connection.as_deref() != Some("close") {
             self.connection_pool.return_connection(host, port, stream);
@@ -653,9 +580,11 @@ impl HttpClient {
         
         stream.write_all(request.as_bytes()).map_err(|e| NetworkError::IoError(format!("Failed to send request: {}", e)))?;
         
+        // Read the full response - headers first, then body
         let mut response_buffer = Vec::new();
-        let mut buffer = [0; 1024];
+        let mut buffer = [0; 4096];
         
+        // Read until we get the header terminator
         loop {
             let bytes_read = stream.read(&mut buffer).map_err(|e| NetworkError::IoError(format!("Failed to read response: {}", e)))?;
             if bytes_read == 0 {
@@ -668,7 +597,29 @@ impl HttpClient {
             }
         }
         
-        let response = self.parse_response(&response_buffer)?;
+        // Find header/body boundary
+        let header_end = response_buffer.windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or_else(|| NetworkError::ParseError("No header terminator found".to_string()))?;
+        
+        // Get any body data that came with the headers
+        let mut resp_body = if response_buffer.len() > header_end + 4 {
+            response_buffer[header_end + 4..].to_vec()
+        } else {
+            Vec::new()
+        };
+        
+        // Continue reading the rest of the body until connection closes
+        loop {
+            let bytes_read = stream.read(&mut buffer).map_err(|e| NetworkError::IoError(format!("Failed to read response body: {}", e)))?;
+            if bytes_read == 0 {
+                break; // Connection closed by server
+            }
+            resp_body.extend_from_slice(&buffer[..bytes_read]);
+        }
+        
+        let header_section = String::from_utf8_lossy(&response_buffer[..header_end]).to_string();
+        let response = self.parse_response_from_parts(&header_section, &resp_body)?;
         
         if self.keep_alive && response.connection.as_deref() != Some("close") {
             self.connection_pool.return_connection(host, port, stream);
@@ -750,6 +701,10 @@ impl HttpClient {
         let header_section = parts[0];
         let body = if parts.len() > 1 { parts[1].as_bytes().to_vec() } else { Vec::new() };
         
+        self.parse_response_from_parts(header_section, &body)
+    }
+    
+    fn parse_response_from_parts(&self, header_section: &str, body: &[u8]) -> Result<HttpResponse, NetworkError> {
         let header_lines: Vec<&str> = header_section.lines().collect();
         if header_lines.is_empty() {
             return Err(NetworkError::ParseError("No status line".to_string()));
@@ -778,7 +733,7 @@ impl HttpClient {
         response.status_code = status_code;
         response.status_text = status_text;
         response.headers = headers;
-        response.body = body;
+        response.body = body.to_vec();
         
         // Extract specific headers
         response.content_type = response.headers.get("content-type").cloned();
@@ -801,6 +756,7 @@ impl HttpClient {
 }
 
 /// FTP client implementation
+#[derive(Clone)]
 pub struct FtpClient {
     user_agent: String,
     timeout: Duration,
@@ -875,7 +831,7 @@ impl FtpClient {
         let data_port = self.parse_pasv_response(&pasv_str)?;
         
         // Connect to data port
-        let data_stream = TcpStream::connect(format!("{}:{}", host, data_port))
+        let mut data_stream = TcpStream::connect(format!("{}:{}", host, data_port))
             .map_err(|e| NetworkError::ConnectionFailed(format!("Failed to connect to data port: {}", e)))?;
         
         // Send RETR command
@@ -930,6 +886,7 @@ impl FtpClient {
 }
 
 /// Gopher client implementation
+#[derive(Clone)]
 pub struct GopherClient {
     user_agent: String,
     timeout: Duration,
@@ -1127,6 +1084,7 @@ impl Clone for HttpClient {
             keep_alive: self.keep_alive,
             max_redirects: self.max_redirects,
             dns_cache: self.dns_cache.clone(),
+            proxy_config: self.proxy_config.clone(),
         }
     }
 }

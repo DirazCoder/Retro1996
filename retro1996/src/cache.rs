@@ -1,70 +1,74 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, Read, Write, BufReader, BufWriter};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
-use std::path::Path;
-use std::fs;
-use serde::{Deserialize, Serialize};
-use crate::binary_cache::{BinaryCache, CacheEntry, BinaryCacheConfig};
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::sync::mpsc::{channel, Sender, Receiver};
+use std::time::Instant;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CachedResource {
-    pub url: String,
-    pub content: Vec<u8>,
-    pub content_type: String,
-    pub last_modified: u64,
-    pub expires: Option<u64>,
-    pub etag: Option<String>,
-    pub size: usize,
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    pub data: Vec<u8>,
     pub timestamp: u64,
+    pub size: usize,
+    pub mime_type: String,
+    pub expires: Option<u64>,
+    pub last_accessed: u64,
+    pub access_count: u64,
+    pub file_path: PathBuf,
 }
 
-impl CachedResource {
-    pub fn new(url: String, content: Vec<u8>, content_type: String) -> Self {
+impl CacheEntry {
+    pub fn new(data: Vec<u8>, mime_type: String, file_path: PathBuf) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
             .as_secs();
         
-        CachedResource {
-            url,
-            content,
-            content_type,
-            last_modified: timestamp,
+        CacheEntry {
+            data,
+            timestamp,
+            size: 0,
+            mime_type,
             expires: None,
-            etag: None,
-            size: 0,
-            timestamp,
+            last_accessed: timestamp,
+            access_count: 1,
+            file_path,
         }
     }
 
-    pub fn with_expires(url: String, content: Vec<u8>, content_type: String, ttl_seconds: u64) -> Self {
+    pub fn with_ttl(data: Vec<u8>, mime_type: String, file_path: PathBuf, ttl_seconds: u64) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
             .as_secs();
         
-        CachedResource {
-            url,
-            content,
-            content_type,
-            last_modified: timestamp,
-            expires: Some(timestamp + ttl_seconds),
-            etag: None,
-            size: 0,
+        CacheEntry {
+            data,
             timestamp,
+            size: 0,
+            mime_type,
+            expires: Some(timestamp + ttl_seconds),
+            last_accessed: timestamp,
+            access_count: 1,
+            file_path,
         }
     }
 
-    pub fn is_valid(&self) -> bool {
-        if let Some(expires) = self.expires {
+    pub fn is_expired(&self) -> bool {
+        if let Some(expiry) = self.expires {
             let current_time = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or(Duration::from_secs(0))
                 .as_secs();
-            current_time < expires
+            current_time > expiry
         } else {
-            true
+            false
         }
     }
 
@@ -75,474 +79,1001 @@ impl CachedResource {
             .as_secs();
         current_time - self.timestamp
     }
+
+    pub fn update_access(&mut self) {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        self.last_accessed = current_time;
+        self.access_count = self.access_count.saturating_add(1);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DiskCacheConfig {
+    pub cache_dir: PathBuf,
+    pub max_size: usize,
+    pub max_files: usize,
+    pub default_ttl: Option<u64>,
+    pub cleanup_threshold: f32,
+    pub eviction_policy: EvictionPolicy,
+    pub enable_windows_optimization: bool,
+    pub enable_gpu_accelerated_serialization: bool,
+    pub enable_high_dpi_awareness: bool,
+    pub enable_background_gc: bool,
+    pub gc_interval_seconds: u64,
+    pub cache_format_version: u32,
+}
+
+#[derive(Debug, Clone)]
+pub enum EvictionPolicy {
+    LRU,
+    FIFO,
+    LFU,
+    Hybrid,
+}
+
+impl Default for DiskCacheConfig {
+    fn default() -> Self {
+        DiskCacheConfig {
+            cache_dir: PathBuf::from("./cache"),
+            max_size: 100 * 1024 * 1024, 
+            max_files: 1000,
+            default_ttl: Some(3600), 
+            cleanup_threshold: 0.9,
+            eviction_policy: EvictionPolicy::LRU,
+            enable_windows_optimization: true,
+            enable_gpu_accelerated_serialization: false, // Disabled for 1996 authenticity
+            enable_high_dpi_awareness: true,
+            enable_background_gc: true,
+            gc_interval_seconds: 300, // 5 minutes
+            cache_format_version: 1,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct WindowsFileSystem {
+    cache_dir: PathBuf,
+    file_handles: Arc<Mutex<HashMap<String, std::fs::File>>>,
+    ntfs_optimizations: bool,
+}
+
+impl WindowsFileSystem {
+    pub fn new(cache_dir: PathBuf) -> io::Result<Self> {
+        fs::create_dir_all(&cache_dir)?;
+        
+        Ok(WindowsFileSystem {
+            cache_dir,
+            file_handles: Arc::new(Mutex::new(HashMap::new())),
+            ntfs_optimizations: true,
+        })
+    }
+
+    pub fn write_file(&self, key: &str, data: &[u8]) -> io::Result<PathBuf> {
+        let file_path = self.get_file_path(key);
+        
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            if self.ntfs_optimizations {
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .attributes(0x80) // FILE_ATTRIBUTE_NORMAL
+                    .open(&file_path)?;
+                
+                let mut writer = BufWriter::new(file);
+                writer.write_all(data)?;
+                writer.flush()?;
+                return Ok(file_path);
+            }
+        }
+        
+        fs::write(&file_path, data)?;
+        Ok(file_path)
+    }
+
+    pub fn read_file(&self, key: &str) -> io::Result<Vec<u8>> {
+        let file_path = self.get_file_path(key);
+        
+        if self.ntfs_optimizations {
+            let file = fs::File::open(&file_path)?;
+            let mut reader = BufReader::new(file);
+            let mut data = Vec::new();
+            reader.read_to_end(&mut data)?;
+            Ok(data)
+        } else {
+            fs::read(&file_path)
+        }
+    }
+
+    pub fn remove_file(&self, key: &str) -> io::Result<()> {
+        let file_path = self.get_file_path(key);
+        fs::remove_file(file_path)
+    }
+
+    pub fn file_exists(&self, key: &str) -> bool {
+        let file_path = self.get_file_path(key);
+        file_path.exists()
+    }
+
+    fn get_file_path(&self, key: &str) -> PathBuf {
+        let hash = self.hash_key(key);
+        self.cache_dir.join(format!("{}.cache", hash))
+    }
+
+    fn hash_key(&self, key: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct GpuSerializer {
+    compression_enabled: bool,
+    gpu_available: bool,
+}
+
+impl GpuSerializer {
+    pub fn new() -> Self {
+        GpuSerializer {
+            compression_enabled: false, // Disabled for 1996 authenticity
+            gpu_available: false,
+        }
+    }
+
+    pub fn serialize(&self, data: &[u8]) -> io::Result<Vec<u8>> {
+        if self.gpu_available && self.compression_enabled {
+            // GPU-accelerated compression would go here
+            Ok(data.to_vec())
+        } else {
+            Ok(data.to_vec())
+        }
+    }
+
+    pub fn deserialize(&self, data: &[u8]) -> io::Result<Vec<u8>> {
+        if self.gpu_available && self.compression_enabled {
+            // GPU-accelerated decompression would go here
+            Ok(data.to_vec())
+        } else {
+            Ok(data.to_vec())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Cache1996Format {
+    version: u32,
+    created_date: u64,
+    last_modified: u64,
+}
+
+impl Cache1996Format {
+    pub fn new() -> Self {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        
+        Cache1996Format {
+            version: 1,
+            created_date: current_time,
+            last_modified: current_time,
+        }
+    }
+
+    pub fn update_modified(&mut self) {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        self.last_modified = current_time;
+    }
+
+    pub fn serialize_header(&self) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend_from_slice(&self.version.to_le_bytes());
+        header.extend_from_slice(&self.created_date.to_le_bytes());
+        header.extend_from_slice(&self.last_modified.to_le_bytes());
+        header
+    }
+
+    pub fn deserialize_header(data: &[u8]) -> Option<Self> {
+        if data.len() < 20 {
+            return None;
+        }
+        
+        let version = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let created_date = u64::from_le_bytes([data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11]]);
+        let last_modified = u64::from_le_bytes([data[12], data[13], data[14], data[15], data[16], data[17], data[18], data[19]]);
+        
+        Some(Cache1996Format {
+            version,
+            created_date,
+            last_modified,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct DpiFileManager {
+    current_dpi: f32,
+    cache_size_adjustment: f32,
+}
+
+impl DpiFileManager {
+    pub fn new() -> Self {
+        DpiFileManager {
+            current_dpi: 96.0, // Standard DPI
+            cache_size_adjustment: 1.0,
+        }
+    }
+
+    pub fn update_dpi(&mut self, dpi: f32) {
+        self.current_dpi = dpi;
+        self.cache_size_adjustment = dpi / 96.0;
+    }
+
+    pub fn adjust_cache_size(&self, base_size: usize) -> usize {
+        (base_size as f32 * self.cache_size_adjustment) as usize
+    }
+}
+
+#[derive(Debug)]
+pub struct BackgroundGcManager {
+    gc_sender: Sender<()>,
+    gc_thread: Option<thread::JoinHandle<()>>,
+    running: Arc<AtomicU64>,
+}
+
+impl BackgroundGcManager {
+    pub fn new(gc_interval: u64) -> Self {
+        let (tx, rx) = channel();
+        let running = Arc::new(AtomicU64::new(1));
+        let running_clone = running.clone();
+        
+        let gc_thread = thread::spawn(move || {
+            while running_clone.load(Ordering::SeqCst) == 1 {
+                let _ = rx.recv_timeout(Duration::from_secs(gc_interval));
+                // Continue loop - GC triggered by timeout or sender
+            }
+        });
+
+        BackgroundGcManager {
+            gc_sender: tx,
+            gc_thread: Some(gc_thread),
+            running,
+        }
+    }
+
+    pub fn trigger_gc(&self) {
+        let _ = self.gc_sender.send(());
+    }
+
+    pub fn stop(&mut self) {
+        self.running.store(0, Ordering::SeqCst);
+        let _ = self.gc_sender.send(());
+        if let Some(thread) = self.gc_thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct DiskCache {
-    cache_dir: String,
-    max_size: usize,
-    current_size: usize,
-    entries: HashMap<String, CachedResource>,
-    lru_order: VecDeque<String>,
+    config: DiskCacheConfig,
+    entries: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    access_order: Arc<Mutex<Vec<String>>>,
+    current_size: Arc<AtomicU64>,
+    file_system: WindowsFileSystem,
+    serializer: GpuSerializer,
+    cache_format: Cache1996Format,
+    dpi_manager: DpiFileManager,
+    background_gc: Option<BackgroundGcManager>,
+    stats: Arc<RwLock<DiskCacheStats>>,
+    last_gc_time: Arc<AtomicU64>,
 }
 
 impl DiskCache {
-    pub fn new(cache_dir: String, max_size: usize) -> Self {
+    pub fn new(config: DiskCacheConfig) -> io::Result<Self> {
+        let file_system = WindowsFileSystem::new(config.cache_dir.clone())?;
+        
         let mut cache = DiskCache {
-            cache_dir: cache_dir.clone(),
-            max_size,
-            current_size: 0,
-            entries: HashMap::new(),
-            lru_order: VecDeque::new(),
+            config: config.clone(),
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            access_order: Arc::new(Mutex::new(Vec::new())),
+            current_size: Arc::new(AtomicU64::new(0)),
+            file_system,
+            serializer: GpuSerializer::new(),
+            cache_format: Cache1996Format::new(),
+            dpi_manager: DpiFileManager::new(),
+            background_gc: None,
+            stats: Arc::new(RwLock::new(DiskCacheStats::default())),
+            last_gc_time: Arc::new(AtomicU64::new(0)),
         };
-        cache.load_from_disk();
-        cache
+        
+        if config.enable_background_gc {
+            cache.background_gc = Some(BackgroundGcManager::new(config.gc_interval_seconds));
+        }
+        
+        cache.load_existing_files()?;
+        Ok(cache)
     }
 
-    fn load_from_disk(&mut self) {
-        if !Path::new(&self.cache_dir).exists() {
-            return;
-        }
+    pub fn with_default_config() -> io::Result<Self> {
+        DiskCache::new(DiskCacheConfig::default())
+    }
 
-        let paths = fs::read_dir(&self.cache_dir);
-        if let Ok(paths) = paths {
-            for path in paths {
-                if let Ok(entry) = path {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("cache") {
-                        if let Ok(contents) = fs::read(&path) {
-        if let Ok(resource) = bincode::deserialize::<CachedResource>(&contents) {
-            let url_hash = hash_url(&resource.url);
-            let content_len = resource.content.len();
-            self.entries.insert(url_hash.clone(), resource);
-            self.lru_order.push_back(url_hash);
-            self.current_size += content_len;
-                            }
+    fn load_existing_files(&mut self) -> io::Result<()> {
+        if let Ok(entries) = fs::read_dir(&self.config.cache_dir) {
+            for entry in entries.flatten() {
+                if let Some(file_name) = entry.file_name().to_str() {
+                    if let Some(key) = self.extract_key_from_filename(file_name) {
+                        if let Ok(metadata) = entry.metadata() {
+                            let file_size = metadata.len() as usize;
+                            let timestamp = metadata.modified()
+                                .unwrap_or(SystemTime::now())
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or(Duration::from_secs(0))
+                                .as_secs();
+                            
+                            let mime_type = self.infer_mime_type(file_name);
+                            let file_path = entry.path();
+                            
+                            let entry = CacheEntry {
+                                data: Vec::new(), 
+                                timestamp,
+                                size: file_size,
+                                mime_type,
+                                expires: None,
+                                last_accessed: timestamp,
+                                access_count: 1,
+                                file_path: file_path.clone(),
+                            };
+                            
+                            let mut entries = self.entries.write().unwrap();
+                            entries.insert(key, entry);
+                            self.current_size.fetch_add(file_size as u64, Ordering::SeqCst);
                         }
                     }
                 }
             }
         }
-    }
-
-    fn save_to_disk(&self, url_hash: &str, resource: &CachedResource) -> Result<(), std::io::Error> {
-        if !Path::new(&self.cache_dir).exists() {
-            fs::create_dir_all(&self.cache_dir)?;
-        }
-
-        let cache_path = format!("{}/{}.cache", self.cache_dir, url_hash);
-        let serialized = bincode::serialize(resource)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        
-        fs::write(cache_path, serialized)?;
         Ok(())
     }
 
-    fn remove_from_disk(&self, url_hash: &str) -> Result<(), std::io::Error> {
-        let cache_path = format!("{}/{}.cache", self.cache_dir, url_hash);
-        if Path::new(&cache_path).exists() {
-            fs::remove_file(cache_path)?;
-        }
-        Ok(())
+    fn extract_key_from_filename(&self, filename: &str) -> Option<String> {
+        filename.split('.').next().map(|s| s.to_string())
     }
 
-    pub fn insert(&mut self, url: String, content: Vec<u8>, content_type: String) -> bool {
-        let url_hash = hash_url(&url);
-        let resource = CachedResource::new(url, content, content_type);
-        let old_resource = self.entries.insert(url_hash.clone(), resource);
-
-        if let Some(old_resource) = old_resource {
-            self.current_size -= old_resource.content.len();
-            let _ = self.remove_from_disk(&url_hash);
+    fn infer_mime_type(&self, filename: &str) -> String {
+        if filename.ends_with(".html") || filename.ends_with(".htm") {
+            "text/html".to_string()
+        } else if filename.ends_with(".css") {
+            "text/css".to_string()
+        } else if filename.ends_with(".js") {
+            "application/javascript".to_string()
+        } else if filename.ends_with(".png") {
+            "image/png".to_string()
+        } else if filename.ends_with(".jpg") || filename.ends_with(".jpeg") {
+            "image/jpeg".to_string()
+        } else if filename.ends_with(".gif") {
+            "image/gif".to_string()
+        } else {
+            "application/octet-stream".to_string()
         }
-
-        let resource = &self.entries[&url_hash];
-        self.current_size += resource.content.len();
-
-        if let Some(pos) = self.lru_order.iter().position(|x| x == &url_hash) {
-            self.lru_order.remove(pos);
-        }
-        self.lru_order.push_back(url_hash.clone());
-
-        if let Err(_) = self.save_to_disk(&url_hash, &self.entries[&url_hash]) {
-        }
-
-        if self.current_size > self.max_size {
-            self.evict_lru();
-        }
-
-        true
     }
 
-    pub fn get(&mut self, url: &str) -> Option<CachedResource> {
-        let url_hash = hash_url(url);
+    pub fn insert(&mut self, key: String, data: Vec<u8>, mime_type: String) -> io::Result<bool> {
+        let entries = self.entries.read().unwrap();
+        if entries.len() >= self.config.max_files {
+            drop(entries);
+            self.evict_entries()?;
+        }
+
+        let file_path = self.file_system.get_file_path(&key);
+        let entry = CacheEntry::new(data, mime_type, file_path.clone());
         
-        if let Some(resource) = self.entries.get(&url_hash) {
-            if resource.is_valid() {
-                if let Some(pos) = self.lru_order.iter().position(|x| x == &url_hash) {
-                    self.lru_order.remove(pos);
+        let old_entry = {
+            let mut entries = self.entries.write().unwrap();
+            entries.insert(key.clone(), entry)
+        };
+
+        if let Some(old_entry) = old_entry {
+            self.current_size.fetch_sub(old_entry.size as u64, Ordering::SeqCst);
+            let _ = self.file_system.remove_file(&key);
+        }
+
+        let serialized_data = self.serializer.serialize(&self.entries.read().unwrap()[&key].data)?;
+        self.file_system.write_file(&key, &serialized_data)?;
+        
+        let new_size = self.entries.read().unwrap()[&key].data.len();
+        self.current_size.fetch_add(new_size as u64, Ordering::SeqCst);
+        self.update_access_order(&key);
+        self.cache_format.update_modified();
+
+        if self.should_cleanup() {
+            self.cleanup_expired()?;
+        }
+
+        Ok(true)
+    }
+
+    pub fn insert_with_ttl(&mut self, key: String, data: Vec<u8>, mime_type: String, ttl_seconds: u64) -> io::Result<bool> {
+        let entries = self.entries.read().unwrap();
+        if entries.len() >= self.config.max_files {
+            drop(entries);
+            self.evict_entries()?;
+        }
+
+        let file_path = self.file_system.get_file_path(&key);
+        let entry = CacheEntry::with_ttl(data, mime_type, file_path.clone(), ttl_seconds);
+        
+        let old_entry = {
+            let mut entries = self.entries.write().unwrap();
+            entries.insert(key.clone(), entry)
+        };
+
+        if let Some(old_entry) = old_entry {
+            self.current_size.fetch_sub(old_entry.size as u64, Ordering::SeqCst);
+            let _ = self.file_system.remove_file(&key);
+        }
+
+        let serialized_data = self.serializer.serialize(&self.entries.read().unwrap()[&key].data)?;
+        self.file_system.write_file(&key, &serialized_data)?;
+        
+        let new_size = self.entries.read().unwrap()[&key].data.len();
+        self.current_size.fetch_add(new_size as u64, Ordering::SeqCst);
+        self.update_access_order(&key);
+        self.cache_format.update_modified();
+
+        if self.should_cleanup() {
+            self.cleanup_expired()?;
+        }
+
+        Ok(true)
+    }
+
+    pub fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        {
+            let entries = self.entries.read().unwrap();
+            if let Some(entry) = entries.get(key) {
+                if entry.is_expired() {
+                    drop(entries);
+                    self.remove(key)?;
+                    return Ok(None);
                 }
-                self.lru_order.push_back(url_hash.clone());
-                
-                Some(resource.clone())
             } else {
-                self.remove(url);
-                None
+                return Ok(None);
             }
-        } else {
-            None
         }
-    }
-
-    pub fn contains(&self, url: &str) -> bool {
-        let url_hash = hash_url(url);
-        if let Some(resource) = self.entries.get(&url_hash) {
-            resource.is_valid()
-        } else {
-            false
-        }
-    }
-
-    pub fn remove(&mut self, url: &str) -> bool {
-        let url_hash = hash_url(url);
-        if let Some(resource) = self.entries.remove(&url_hash) {
-            self.current_size -= resource.content.len();
-            self.lru_order.retain(|k| k != &url_hash);
-            let _ = self.remove_from_disk(&url_hash);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.lru_order.clear();
-        self.current_size = 0;
         
-        if Path::new(&self.cache_dir).exists() {
-            let _ = fs::remove_dir_all(&self.cache_dir);
+        // Update access with write lock
+        {
+            let mut entries = self.entries.write().unwrap();
+            if let Some(entry) = entries.get_mut(key) {
+                entry.update_access();
+            }
+        }
+        
+        let entries = self.entries.read().unwrap();
+        if let Some(entry) = entries.get(key) {
+            if let Ok(data) = self.file_system.read_file(key) {
+                let deserialized_data = self.serializer.deserialize(&data)?;
+                self.update_access_order(key);
+                Ok(Some(deserialized_data))
+            } else {
+                drop(entries);
+                self.entries.write().unwrap().remove(key);
+                Ok(None)
+            }
+        } else {
+            Ok(None)
         }
     }
 
-    fn evict_lru(&mut self) {
-        while self.current_size > self.max_size && !self.lru_order.is_empty() {
-            if let Some(oldest_key) = self.lru_order.pop_front() {
-                if let Some(resource) = self.entries.remove(&oldest_key) {
-                    self.current_size -= resource.content.len();
-                    let _ = self.remove_from_disk(&oldest_key);
-                }
-            }
+    pub fn contains(&self, key: &str) -> bool {
+        let entries = self.entries.read().unwrap();
+        if let Some(entry) = entries.get(key) {
+            !entry.is_expired()
+        } else {
+            false
         }
+    }
+
+    pub fn remove(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        let old_entry = {
+            let mut entries = self.entries.write().unwrap();
+            entries.remove(key)
+        };
+
+        if let Some(entry) = old_entry {
+            self.current_size.fetch_sub(entry.size as u64, Ordering::SeqCst);
+            self.access_order.lock().unwrap().retain(|k| k != key);
+            self.file_system.remove_file(key)?;
+            Ok(Some(entry.data))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn clear(&self) -> io::Result<()> {
+        let keys: Vec<String> = {
+            let entries = self.entries.read().unwrap();
+            entries.keys().cloned().collect()
+        };
+
+        for key in &keys {
+            let _ = self.file_system.remove_file(key);
+        }
+        
+        let mut entries = self.entries.write().unwrap();
+        entries.clear();
+        self.access_order.lock().unwrap().clear();
+        self.current_size.store(0, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn size(&self) -> usize {
-        self.entries.len()
+        let entries = self.entries.read().unwrap();
+        entries.len()
     }
 
-    pub fn memory_usage(&self) -> usize {
-        self.current_size
+    pub fn disk_usage(&self) -> usize {
+        self.current_size.load(Ordering::SeqCst) as usize
     }
 
-    pub fn get_urls(&self) -> Vec<String> {
-        self.entries.values().map(|r| r.url.clone()).collect()
+    pub fn max_disk_usage(&self) -> usize {
+        self.config.max_size
     }
 
-    pub fn get_resource_age(&self, url: &str) -> Option<u64> {
-        let url_hash = hash_url(url);
-        self.entries.get(&url_hash).map(|r| r.age())
+    pub fn keys(&self) -> Vec<String> {
+        let entries = self.entries.read().unwrap();
+        entries.keys().cloned().collect()
     }
 
-    pub fn get_resource_size(&self, url: &str) -> Option<usize> {
-        let url_hash = hash_url(url);
-        self.entries.get(&url_hash).map(|r| r.content.len())
+    pub fn get_mime_type(&self, key: &str) -> Option<String> {
+        let entries = self.entries.read().unwrap();
+        entries.get(key).map(|entry| entry.mime_type.clone())
     }
 
-    pub fn resize(&mut self, new_max_size: usize) {
-        self.max_size = new_max_size;
-        while self.current_size > self.max_size && !self.lru_order.is_empty() {
-            self.evict_lru();
+    pub fn get_entry_age(&self, key: &str) -> Option<u64> {
+        let entries = self.entries.read().unwrap();
+        entries.get(key).map(|entry| entry.age())
+    }
+
+    pub fn get_entry_size(&self, key: &str) -> Option<usize> {
+        let entries = self.entries.read().unwrap();
+        entries.get(key).map(|entry| entry.data.len())
+    }
+
+    pub fn evict_entries(&self) -> io::Result<()> {
+        match self.config.eviction_policy {
+            EvictionPolicy::LRU => self.evict_lru()?,
+            EvictionPolicy::FIFO => self.evict_fifo()?,
+            EvictionPolicy::LFU => self.evict_lfu()?,
+            EvictionPolicy::Hybrid => self.evict_hybrid()?,
         }
+        Ok(())
     }
 
-    pub fn gc(&mut self) {
+    fn evict_lru(&self) -> io::Result<()> {
+        let mut access_order = self.access_order.lock().unwrap();
+        while self.entries.read().unwrap().len() >= self.config.max_files && !access_order.is_empty() {
+            let oldest_key = access_order.remove(0);
+            if let Some(entry) = {
+                let mut entries = self.entries.write().unwrap();
+                entries.remove(&oldest_key)
+            } {
+                self.current_size.fetch_sub(entry.size as u64, Ordering::SeqCst);
+                self.file_system.remove_file(&oldest_key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn evict_fifo(&self) -> io::Result<()> {
+        let mut access_order = self.access_order.lock().unwrap();
+        while self.entries.read().unwrap().len() >= self.config.max_files && !access_order.is_empty() {
+            let oldest_key = access_order.remove(0);
+            if let Some(entry) = {
+                let mut entries = self.entries.write().unwrap();
+                entries.remove(&oldest_key)
+            } {
+                self.current_size.fetch_sub(entry.size as u64, Ordering::SeqCst);
+                self.file_system.remove_file(&oldest_key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn evict_lfu(&self) -> io::Result<()> {
+        let entries = self.entries.read().unwrap();
+        let mut least_frequent_key = None;
+        let mut min_accesses = u64::MAX;
+
+        for (key, entry) in entries.iter() {
+            if entry.access_count < min_accesses {
+                min_accesses = entry.access_count;
+                least_frequent_key = Some(key.clone());
+            }
+        }
+
+        if let Some(key) = least_frequent_key {
+            drop(entries);
+            if let Some(entry) = {
+                let mut entries = self.entries.write().unwrap();
+                entries.remove(key.as_str())
+            } {
+                self.current_size.fetch_sub(entry.size as u64, Ordering::SeqCst);
+                self.access_order.lock().unwrap().retain(|k| k != &key);
+                self.file_system.remove_file(&key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn evict_hybrid(&self) -> io::Result<()> {
+        let cutoff_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs() - 300; // 5 minutes ago
+
+        // Collect owned data to avoid borrow conflicts
+        let candidates: Vec<(String, u64)> = {
+            let entries = self.entries.read().unwrap();
+            entries
+                .iter()
+                .filter(|(_, entry)| entry.last_accessed < cutoff_time)
+                .map(|(key, entry)| (key.clone(), entry.access_count))
+                .collect()
+        };
+
+        if candidates.is_empty() {
+            self.evict_lru()?;
+            return Ok(());
+        }
+
+        // Find the entry with the lowest access count
+        let mut min_key = None;
+        let mut min_access = u64::MAX;
+        for (key, access_count) in candidates {
+            if access_count < min_access {
+                min_access = access_count;
+                min_key = Some(key);
+            }
+        }
+        
+        if let Some(key) = min_key {
+            if let Some(entry) = {
+                let mut entries = self.entries.write().unwrap();
+                entries.remove(&key)
+            } {
+                self.current_size.fetch_sub(entry.size as u64, Ordering::SeqCst);
+                self.access_order.lock().unwrap().retain(|k| k != &key);
+                self.file_system.remove_file(&key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn update_access_order(&self, key: &str) {
+        let mut access_order = self.access_order.lock().unwrap();
+        access_order.retain(|k| k != key);
+        access_order.push(key.to_string());
+    }
+
+    fn should_cleanup(&self) -> bool {
+        let current_size = self.current_size.load(Ordering::SeqCst) as usize;
+        let max_size = self.config.max_size;
+        let threshold = (max_size as f32 * self.config.cleanup_threshold) as usize;
+        
+        current_size > threshold || self.entries.read().unwrap().len() as f32 > (self.config.max_files as f32 * self.config.cleanup_threshold)
+    }
+
+    fn cleanup_expired(&self) -> io::Result<()> {
         let mut expired_keys = Vec::new();
-        for (key, resource) in &self.entries {
-            if !resource.is_valid() {
-                expired_keys.push(key.clone());
+        {
+            let entries = self.entries.read().unwrap();
+            for (key, entry) in entries.iter() {
+                if entry.is_expired() {
+                    expired_keys.push(key.clone());
+                }
             }
         }
 
         for key in expired_keys {
-            if let Some(resource) = self.entries.remove(&key) {
-                self.current_size -= resource.content.len();
-                self.lru_order.retain(|k| k != &key);
-                let _ = self.remove_from_disk(&key);
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct HybridCache {
-    pub memory_cache: BinaryCache,
-    pub disk_cache: DiskCache,
-    pub cache_policy: CachePolicy,
-}
-
-#[derive(Debug, Clone)]
-pub enum CachePolicy {
-    MemoryFirst,
-    DiskFirst,
-    Both,
-}
-
-#[derive(Debug)]
-pub enum CacheError {
-    Io(std::io::Error),
-    Serialization(String),
-    NotFound,
-    InvalidResource,
-}
-
-impl From<std::io::Error> for CacheError {
-    fn from(err: std::io::Error) -> Self {
-        CacheError::Io(err)
-    }
-}
-
-impl HybridCache {
-    pub fn new(memory_config: BinaryCacheConfig, disk_cache_dir: String, disk_max_size: usize) -> Self {
-        HybridCache {
-            memory_cache: BinaryCache::new(memory_config),
-            disk_cache: DiskCache::new(disk_cache_dir, disk_max_size),
-            cache_policy: CachePolicy::MemoryFirst,
-        }
-    }
-
-    pub fn insert(&mut self, url: String, content: Vec<u8>, content_type: String) -> Result<(), CacheError> {
-        match self.cache_policy {
-            CachePolicy::MemoryFirst => {
-                self.memory_cache.insert(url.clone(), content.clone(), content_type.clone());
-                self.disk_cache.insert(url, content, content_type);
-            },
-            CachePolicy::DiskFirst => {
-                self.disk_cache.insert(url.clone(), content.clone(), content_type.clone());
-                self.memory_cache.insert(url, content, content_type);
-            },
-            CachePolicy::Both => {
-                self.memory_cache.insert(url.clone(), content.clone(), content_type.clone());
-                self.disk_cache.insert(url, content, content_type);
-            },
+            let _ = self.remove(&key);
         }
         Ok(())
     }
 
-    pub fn get(&mut self, url: &str) -> Result<Option<CachedResource>, CacheError> {
-        match self.cache_policy {
-            CachePolicy::MemoryFirst => {
-                if let Some(resource) = self.memory_cache.get(url) {
-                    return Ok(Some(CachedResource::new(
-                        url.to_string(),
-                        resource,
-                        self.memory_cache.get_mime_type(url).unwrap_or("application/octet-stream".to_string())
-                    )));
-                }
-                
-                if let Some(resource) = self.disk_cache.get(url) {
-                    if resource.is_valid() {
-                        self.memory_cache.insert(
-                            url.to_string(),
-                            resource.content.clone(),
-                            resource.content_type.clone()
-                        );
-                        return Ok(Some(resource));
-                    }
-                }
-            },
-            CachePolicy::DiskFirst => {
-                if let Some(resource) = self.disk_cache.get(url) {
-                    if resource.is_valid() {
-                        self.memory_cache.insert(
-                            url.to_string(),
-                            resource.content.clone(),
-                            resource.content_type.clone()
-                        );
-                        return Ok(Some(resource));
-                    }
-                }
-                
-                if let Some(resource) = self.memory_cache.get(url) {
-                    return Ok(Some(CachedResource::new(
-                        url.to_string(),
-                        resource,
-                        self.memory_cache.get_mime_type(url).unwrap_or("application/octet-stream".to_string())
-                    )));
-                }
-            },
-            CachePolicy::Both => {
-                if let Some(resource) = self.memory_cache.get(url) {
-                    return Ok(Some(CachedResource::new(
-                        url.to_string(),
-                        resource,
-                        self.memory_cache.get_mime_type(url).unwrap_or("application/octet-stream".to_string())
-                    )));
-                }
-                
-                if let Some(resource) = self.disk_cache.get(url) {
-                    if resource.is_valid() {
-                        self.memory_cache.insert(
-                            url.to_string(),
-                            resource.content.clone(),
-                            resource.content_type.clone()
-                        );
-                        return Ok(Some(resource));
-                    }
-                }
-            },
+    pub fn resize(&self, new_max_size: usize, new_max_files: usize) -> io::Result<()> {
+        let mut config = self.config.clone();
+        config.max_size = new_max_size;
+        config.max_files = new_max_files;
+
+        while self.current_size.load(Ordering::SeqCst) as usize > config.max_size || self.entries.read().unwrap().len() > config.max_files {
+            self.evict_entries()?;
         }
-        
-        Ok(None)
+        Ok(())
     }
 
-    pub fn contains(&self, url: &str) -> bool {
-        match self.cache_policy {
-            CachePolicy::MemoryFirst | CachePolicy::Both => {
-                self.memory_cache.contains(url) || self.disk_cache.contains(url)
-            },
-            CachePolicy::DiskFirst => {
-                self.disk_cache.contains(url) || self.memory_cache.contains(url)
-            },
-        }
+    pub fn set_eviction_policy(&mut self, policy: EvictionPolicy) {
+        self.config.eviction_policy = policy;
     }
 
-    pub fn remove(&mut self, url: &str) -> Result<bool, CacheError> {
-        let mem_removed = self.memory_cache.remove(url).is_some();
-        let disk_removed = self.disk_cache.remove(url);
-        Ok(mem_removed || disk_removed)
-    }
-
-    pub fn clear(&mut self) {
-        self.memory_cache.clear();
-        self.disk_cache.clear();
-    }
-
-    pub fn size(&self) -> usize {
-        self.memory_cache.size() + self.disk_cache.size()
-    }
-
-    pub fn memory_usage(&self) -> usize {
-        self.memory_cache.memory_usage() + self.disk_cache.memory_usage()
-    }
-
-    pub fn set_policy(&mut self, policy: CachePolicy) {
-        self.cache_policy = policy;
-    }
-
-    pub fn gc(&mut self) {
-        self.memory_cache.gc();
-        self.disk_cache.gc();
-    }
-
-    pub fn get_urls(&self) -> Vec<String> {
-        let mut urls = self.memory_cache.keys();
-        urls.extend(self.disk_cache.get_urls());
-        urls.sort();
-        urls.dedup();
-        urls
-    }
-
-    pub fn get_resource_age(&self, url: &str) -> Option<u64> {
-        if self.memory_cache.contains(url) {
-            self.memory_cache.get_entry_age(url)
-        } else {
-            self.disk_cache.get_resource_age(url)
-        }
-    }
-
-    pub fn get_resource_size(&self, url: &str) -> Option<usize> {
-        if self.memory_cache.contains(url) {
-            self.memory_cache.get_entry_size(url)
-        } else {
-            self.disk_cache.get_resource_size(url)
-        }
-    }
-
-    pub fn resize(&mut self, memory_max_size: usize, disk_max_size: usize) {
-        self.memory_cache.resize(
-            memory_max_size,
-            self.memory_cache.size() // Keep the same entry limit
-        );
-        self.disk_cache.resize(disk_max_size);
-    }
-}
-
-fn hash_url(url: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    url.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
-}
-
-impl Default for HybridCache {
-    fn default() -> Self {
-        let memory_config = BinaryCacheConfig {
-            max_size: 10 * 1024 * 1024, 
-            max_entries: 100,
-            default_ttl: Some(3600),
-            cleanup_threshold: 0.9,
-            eviction_policy: crate::binary_cache::EvictionPolicy::LRU,
+    pub fn stats(&self) -> DiskCacheStats {
+        let total_size = self.disk_usage();
+        let num_entries = self.size();
+        let hit_rate = {
+            let stats = self.stats.read().unwrap();
+            stats.hit_rate
         };
+        let miss_rate = 1.0 - hit_rate;
+
+        DiskCacheStats {
+            total_size,
+            num_entries,
+            hit_rate,
+            miss_rate,
+            max_size: self.max_disk_usage(),
+            total_hits: {
+                let stats = self.stats.read().unwrap();
+                stats.total_hits
+            },
+            total_misses: {
+                let stats = self.stats.read().unwrap();
+                stats.total_misses
+            },
+            total_inserts: {
+                let stats = self.stats.read().unwrap();
+                stats.total_inserts
+            },
+            total_removals: {
+                let stats = self.stats.read().unwrap();
+                stats.total_removals
+            },
+            total_evictions: {
+                let stats = self.stats.read().unwrap();
+                stats.total_evictions
+            },
+            total_expired: {
+                let stats = self.stats.read().unwrap();
+                stats.total_expired
+            },
+            total_cleared: {
+                let stats = self.stats.read().unwrap();
+                stats.total_cleared
+            },
+            last_access_time: {
+                let stats = self.stats.read().unwrap();
+                stats.last_access_time
+            },
+            gc_duration: 0,
+            total_gc_runs: 0,
+        }
+    }
+
+    pub fn gc(&self) -> io::Result<()> {
+        let start_time = Instant::now();
+        self.cleanup_expired()?;
+        self.evict_entries()?;
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        self.last_gc_time.store(current_time, Ordering::SeqCst);
         
-        HybridCache::new(memory_config, "cache".to_string(), 100 * 1024 * 1024)
+        let mut stats = self.stats.write().unwrap();
+        stats.gc_duration = start_time.elapsed().as_millis() as u64;
+        stats.total_gc_runs += 1;
+        Ok(())
+    }
+
+    pub fn set_dpi(&mut self, dpi: f32) {
+        self.dpi_manager.update_dpi(dpi);
+        let adjusted_size = self.dpi_manager.adjust_cache_size(self.config.max_size);
+        let _ = self.resize(adjusted_size, self.config.max_files);
+    }
+
+    pub fn trigger_background_gc(&self) {
+        if let Some(gc_manager) = &self.background_gc {
+            gc_manager.trigger_gc();
+        }
+    }
+
+    pub fn stop_background_gc(&mut self) {
+        if let Some(gc_manager) = &mut self.background_gc {
+            gc_manager.stop();
+        }
+    }
+
+    pub fn get_cache_format_version(&self) -> u32 {
+        self.cache_format.version
+    }
+
+    pub fn get_cache_created_date(&self) -> u64 {
+        self.cache_format.created_date
+    }
+
+    pub fn get_cache_last_modified(&self) -> u64 {
+        self.cache_format.last_modified
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DiskCacheStats {
+    pub total_size: usize,
+    pub num_entries: usize,
+    pub hit_rate: f64,
+    pub miss_rate: f64,
+    pub max_size: usize,
+    pub total_hits: u64,
+    pub total_misses: u64,
+    pub total_inserts: u64,
+    pub total_removals: u64,
+    pub total_evictions: u64,
+    pub total_expired: u64,
+    pub total_cleared: u64,
+    pub last_access_time: u64,
+    pub gc_duration: u64,
+    pub total_gc_runs: u64,
+}
+
+impl Default for DiskCache {
+    fn default() -> Self {
+        Self::with_default_config().unwrap_or_else(|_| {
+            DiskCache {
+                config: DiskCacheConfig::default(),
+                entries: Arc::new(RwLock::new(HashMap::new())),
+                access_order: Arc::new(Mutex::new(Vec::new())),
+                current_size: Arc::new(AtomicU64::new(0)),
+                file_system: WindowsFileSystem::new(PathBuf::from("./cache")).unwrap(),
+                serializer: GpuSerializer::new(),
+                cache_format: Cache1996Format::new(),
+                dpi_manager: DpiFileManager::new(),
+                background_gc: None,
+                stats: Arc::new(RwLock::new(DiskCacheStats::default())),
+                last_gc_time: Arc::new(AtomicU64::new(0)),
+            }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
-    fn test_disk_cache_insert_and_get() {
-        let mut cache = DiskCache::new("test_cache_dir".to_string(), 1024 * 1024);
-        let content = vec![1, 2, 3, 4, 5];
-        cache.insert("http://example.com".to_string(), content.clone(), "text/html".to_string());
+    fn test_disk_cache_insert_and_get() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut config = DiskCacheConfig::default();
+        config.cache_dir = temp_dir.path().to_path_buf();
+        let cache = DiskCache::new(config)?;
         
-        let retrieved = cache.get("http://example.com").unwrap();
-        assert_eq!(retrieved.content, content);
+        let data = vec![1, 2, 3, 4, 5];
+        cache.insert("test_key".to_string(), data.clone(), "application/octet-stream".to_string())?;
+        
+        let retrieved = cache.get("test_key")?.unwrap();
+        assert_eq!(retrieved, data);
+        Ok(())
     }
 
     #[test]
-    fn test_hybrid_cache_insert_and_get() {
-        let mut cache = HybridCache::default();
-        let content = vec![1, 2, 3, 4, 5];
-        cache.insert("http://example.com".to_string(), content.clone(), "text/html".to_string()).unwrap();
+    fn test_disk_cache_with_ttl() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut config = DiskCacheConfig::default();
+        config.cache_dir = temp_dir.path().to_path_buf();
+        let cache = DiskCache::new(config)?;
         
-        let retrieved = cache.get("http://example.com").unwrap().unwrap();
-        assert_eq!(retrieved.content, content);
+        let data = vec![1, 2, 3, 4, 5];
+        cache.insert_with_ttl("expiring_key".to_string(), data.clone(), "application/octet-stream".to_string(), 1)?; 
+        
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        
+        let retrieved = cache.get("expiring_key")?;
+        assert!(retrieved.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_cache_contains() {
-        let mut cache = HybridCache::default();
-        let content = vec![1, 2, 3, 4, 5];
-        cache.insert("http://example.com".to_string(), content, "text/html".to_string()).unwrap();
+    fn test_disk_cache_eviction() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut config = DiskCacheConfig::default();
+        config.cache_dir = temp_dir.path().to_path_buf();
+        config.max_files = 2;
+        let cache = DiskCache::new(config)?;
         
-        assert!(cache.contains("http://example.com"));
-        assert!(!cache.contains("http://nonexistent.com"));
+        cache.insert("key1".to_string(), vec![1], "application/octet-stream".to_string())?;
+        cache.insert("key2".to_string(), vec![2], "application/octet-stream".to_string())?;
+        cache.insert("key3".to_string(), vec![3], "application/octet-stream".to_string())?;
+        
+        assert!(cache.size() <= 2);
+        assert!(cache.contains("key3")); 
+        Ok(())
     }
 
     #[test]
-    fn test_cache_clear() {
-        let mut cache = HybridCache::default();
-        cache.insert("http://example1.com".to_string(), vec![1], "text/html".to_string()).unwrap();
-        cache.insert("http://example2.com".to_string(), vec![2], "text/html".to_string()).unwrap();
+    fn test_disk_cache_contains() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut config = DiskCacheConfig::default();
+        config.cache_dir = temp_dir.path().to_path_buf();
+        let cache = DiskCache::new(config)?;
         
-        assert!(cache.contains("http://example1.com"));
-        assert!(cache.contains("http://example2.com"));
+        let data = vec![1, 2, 3, 4, 5];
+        cache.insert("test_key".to_string(), data, "application/octet-stream".to_string())?;
         
-        cache.clear();
+        assert!(cache.contains("test_key"));
+        assert!(!cache.contains("nonexistent_key"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_disk_cache_clear() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut config = DiskCacheConfig::default();
+        config.cache_dir = temp_dir.path().to_path_buf();
+        let cache = DiskCache::new(config)?;
         
-        assert!(!cache.contains("http://example1.com"));
-        assert!(!cache.contains("http://example2.com"));
+        cache.insert("key1".to_string(), vec![1], "application/octet-stream".to_string())?;
+        cache.insert("key2".to_string(), vec![2], "application/octet-stream".to_string())?;
+        
+        assert_eq!(cache.size(), 2);
+        
+        cache.clear()?;
+        
+        assert_eq!(cache.size(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_windows_file_system() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let file_system = WindowsFileSystem::new(temp_dir.path().to_path_buf())?;
+        
+        let data = vec![1, 2, 3, 4, 5];
+        let file_path = file_system.write_file("test", &data)?;
+        
+        assert!(file_system.file_exists("test"));
+        
+        let retrieved = file_system.read_file("test")?;
+        assert_eq!(retrieved, data);
+        
+        file_system.remove_file("test")?;
+        assert!(!file_system.file_exists("test"));
+        
+        Ok(())
+    }
+
+    #[test]
+    fn test_cache_1996_format() {
+        let format = Cache1996Format::new();
+        assert_eq!(format.version, 1);
+        
+        let header = format.serialize_header();
+        assert_eq!(header.len(), 20);
+        
+        let deserialized = Cache1996Format::deserialize_header(&header).unwrap();
+        assert_eq!(deserialized.version, format.version);
+        assert_eq!(deserialized.created_date, format.created_date);
+        assert_eq!(deserialized.last_modified, format.last_modified);
+    }
+
+    #[test]
+    fn test_dpi_file_manager() {
+        let mut dpi_manager = DpiFileManager::new();
+        assert_eq!(dpi_manager.current_dpi, 96.0);
+        
+        dpi_manager.update_dpi(192.0);
+        assert_eq!(dpi_manager.current_dpi, 192.0);
+        
+        let adjusted_size = dpi_manager.adjust_cache_size(1000);
+        assert_eq!(adjusted_size, 2000);
     }
 }

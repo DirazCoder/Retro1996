@@ -27,33 +27,28 @@ pub mod print;
 pub mod error_pages;
 pub mod image_handler;
 pub mod ini_preferences;
+pub mod html_parser;
+pub mod css_parser;
+pub mod dom;
 
 // Re-export key types for easier use
 pub use engine::{TrussCore, EngineConfig, RenderingMode, DisplayList, DomNode, RenderNode, CssRule, CssValue, QuirkProfile};
-pub use network::{NetworkManager, HttpClient, FtpClient, GopherClient, TcpClient, HttpResponse};
+pub use network::{NetworkManager, HttpClient, FtpClient, GopherClient, HttpResponse};
 pub use ui::{Retro1996Browser, BrowserState, HistoryEntry, Bookmark, FindState, PrintSettings};
 pub use javascript_engine::{ChronoScript, JsValue, JsError};
-pub use cache::HybridCache;
+pub use cache::{DiskCache, WindowsFileSystem, GpuSerializer, Cache1996Format, DpiFileManager, BackgroundGcManager};
 pub use history::HistoryManager;
 pub use bookmarks::BookmarkManager;
 pub use preferences::Preferences;
-pub use forms::FormManager;
-pub use downloads::DownloadManager;
 pub use animation::AnimationManager;
 pub use charset::CharsetDetector;
 pub use mailto::MailtoHandler;
-pub use search::SearchManager;
 pub use accessibility::AccessibilityManager;
-pub use accessibility_utils::AccessibilityUtils;
-pub use sound::SoundManager;
-pub use dpi_awareness::DpiAwareness;
 pub use binary_cache::BinaryCache;
-pub use binary_history::BinaryHistory;
 pub use plugins::PluginManager;
 pub use security::SecurityManager;
 pub use print::PrintManager;
 pub use error_pages::ErrorPageGenerator;
-pub use image_handler::ImageHandler;
 pub use ini_preferences::IniPreferences;
 
 // Browser configuration and constants
@@ -62,14 +57,6 @@ pub const DEFAULT_VIEWPORT_WIDTH: f32 = 800.0;
 pub const DEFAULT_VIEWPORT_HEIGHT: f32 = 600.0;
 pub const WEB_SAFE_PALETTE_SIZE: usize = 216;
 
-/// Initialize a complete Retro1996 browser instance
-pub fn create_browser() -> Retro1996Browser {
-    let engine = TrussCore::new();
-    let js_engine = ChronoScript::new();
-    let network = NetworkManager::new();
-    Retro1996Browser::new(engine, js_engine, network)
-}
-
 /// Test function to verify compilation and basic functionality
 pub fn test_compilation() {
     println!("Retro1996 Browser - Compilation test passed!");
@@ -77,15 +64,15 @@ pub fn test_compilation() {
     println!("Web Safe Palette: {} colors", WEB_SAFE_PALETTE_SIZE);
     
     // Test basic engine creation
-    let engine = TrussCore::new();
+    let _engine = TrussCore::new();
     println!("TrussCore engine initialized successfully");
     
     // Test JavaScript engine
-    let js_engine = ChronoScript::new();
+    let _js_engine = ChronoScript::new();
     println!("ChronoScript JavaScript engine initialized successfully");
     
     // Test network manager
-    let network = NetworkManager::new();
+    let _network = NetworkManager::new();
     println!("Network manager initialized successfully");
     
     println!("All core components initialized successfully!");
@@ -100,7 +87,7 @@ pub fn version_info() -> &'static str {
 pub fn build_info() -> String {
     format!(
         "Built on: {} at {}",
-        env!("BUILD_DATE", "unknown"),
-        env!("BUILD_TIME", "unknown")
+        option_env!("BUILD_DATE").unwrap_or("unknown"),
+        option_env!("BUILD_TIME").unwrap_or("unknown")
     )
 }

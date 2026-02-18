@@ -4,16 +4,17 @@ version = "3.0.0"
 edition = "2021"
 description = "Retro1996 Browser - An authentic 1996-era web browser"
 authors = ["Retro1996 Project"]
-repository = "https://github.com/retro1996/retro1996"
+repository = "https://github.com/DirazMuhammad/Retro1996"
 license = "MIT"
 
 [[bin]]
 name = "retro1996"
 path = "src/main.rs"
+windows-subsystem = "windows"
 
 [dependencies]
 # Core Rust ecosystem (available and mature by 1996 standards)
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -48,7 +49,7 @@ html-escape = "0.2"
 encoding_rs = "0.8"
 
 # Platform-specific (Windows 1996 era)
-winapi = { version = "0.3", features = ["winuser", "winbase", "handleapi", "processthreadsapi", "memoryapi", "sysinfoapi", "wincon", "shellapi", "winreg", "psapi", "fileapi", "minwindef", "winnt", "heapapi", "synchapi", "processenv", "libloaderapi", "errhandlingapi", "timezoneapi"] }
+winapi = { version = "0.3", features = ["winuser", "winbase", "handleapi", "processthreadsapi", "memoryapi", "sysinfoapi", "wincon", "shellapi", "winreg", "psapi", "fileapi", "minwindef", "winnt", "heapapi", "synchapi", "processenv", "libloaderapi", "errhandlingapi", "timezoneapi", "winsock2", "wininet", "commdlg", "ws2def", "ws2ipdef", "inaddr", "winerror"] }
 windows = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_System_IO",
@@ -97,6 +98,11 @@ crossbeam = "0.8"
 # Text processing
 unicode-segmentation = "1.10"
 unicode-normalization = "0.1.22"
+
+# Networking
+url = "2.5"
+native-tls = "0.2"
+reqwest = { version = "0.11", features = ["blocking"] }
 
 # System and platform
 libc = "0.2"

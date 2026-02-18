@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::fmt;
 use encoding_rs::Encoding;
 use crate::engine::TrussCore;
 
@@ -58,6 +59,18 @@ pub enum JsError {
     ReferenceError(String),
     RangeError(String),
     InternalError(String),
+}
+
+impl fmt::Display for JsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JsError::SyntaxError(msg) => write!(f, "SyntaxError: {}", msg),
+            JsError::TypeError(msg) => write!(f, "TypeError: {}", msg),
+            JsError::ReferenceError(msg) => write!(f, "ReferenceError: {}", msg),
+            JsError::RangeError(msg) => write!(f, "RangeError: {}", msg),
+            JsError::InternalError(msg) => write!(f, "InternalError: {}", msg),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -430,7 +443,7 @@ impl Lexer {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Identifier(String),
     Number(f64),
@@ -449,7 +462,7 @@ pub enum Expr {
     Typeof(Box<Expr>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Expression(Expr),
     VariableDecl(String, Option<Expr>),
@@ -1039,6 +1052,7 @@ pub struct ChronoScript {
     pub prototypes: HashMap<String, JsObject>,
     pub event_listeners: HashMap<String, JsFunction>,
     pub error_buffer: Vec<String>,
+    pub output_buffer: String,
     pub trusscore_bridge: Option<Arc<Mutex<TrussCore>>>,
     pub execution_contexts: Vec<ExecutionContext>,
     pub parsing_in_progress: bool,
@@ -1056,6 +1070,7 @@ impl ChronoScript {
             prototypes: HashMap::new(),
             event_listeners: HashMap::new(),
             error_buffer: Vec::new(),
+            output_buffer: String::new(),
             trusscore_bridge: None,
             execution_contexts: Vec::new(),
             parsing_in_progress: false,
@@ -1905,7 +1920,7 @@ impl ChronoScript {
                     
                     let mut func_ctx = ExecutionContext::new(func_scope, JsValue::Object(new_obj.clone()));
                     for stmt in &func.body {
-                        self.eval_stmt(*stmt.clone(), &mut func_ctx)?;
+                        self.eval_stmt(stmt.clone(), &mut func_ctx)?;
                     }
                     
                     Ok(JsValue::Object(new_obj))
@@ -1993,41 +2008,24 @@ impl ChronoScript {
         self.error_buffer.push(error_msg);
     }
     
+    /// Clear the output buffer
+    pub fn clear_output(&mut self) {
+        self.output_buffer.clear();
+    }
+    
+    /// Get the current output buffer content
+    pub fn get_output(&self) -> String {
+        self.output_buffer.clone()
+    }
+    
+    /// Append content to the output buffer (used by document.write)
+    pub fn append_output(&mut self, content: &str) {
+        self.output_buffer.push_str(content);
+    }
+    
     pub fn update_live_collections(&mut self) {
-        if let Some(ref bridge) = self.trusscore_bridge {
-            let trusscore = bridge.lock().unwrap();
-            
-            let images_count = trusscore.document_collection.lock().unwrap().images.len();
-            let mut image_collection = Vec::new();
-            for i in 0..images_count {
-                image_collection.push(JsValue::String(format!("image_{}", i)));
-            }
-            
-            let forms_count = trusscore.document_collection.lock().unwrap().forms.len();
-            let mut form_collection = Vec::new();
-            for i in 0..forms_count {
-                form_collection.push(JsValue::String(format!("form_{}", i)));
-            }
-            
-            let links_count = trusscore.document_collection.lock().unwrap().links.len();
-            let mut link_collection = Vec::new();
-            for i in 0..links_count {
-                link_collection.push(JsValue::String(format!("link_{}", i)));
-            }
-            
-            let anchors_count = trusscore.document_collection.lock().unwrap().anchors.len();
-            let mut anchor_collection = Vec::new();
-            for i in 0..anchors_count {
-                anchor_collection.push(JsValue::String(format!("anchor_{}", i)));
-            }
-            
-            if let Some(JsValue::Object(ref mut doc_obj)) = self.global_scope.get_mut("document") {
-                doc_obj.set_property("images".to_string(), JsValue::Array(image_collection));
-                doc_obj.set_property("forms".to_string(), JsValue::Array(form_collection));
-                doc_obj.set_property("links".to_string(), JsValue::Array(link_collection));
-                doc_obj.set_property("anchors".to_string(), JsValue::Array(anchor_collection));
-            }
-        }
+        // Live collections are not implemented in this version
+        // The document collections are managed by TrussCore directly
     }
     
     pub fn document_write(&mut self, html: &str) -> Result<(), JsError> {

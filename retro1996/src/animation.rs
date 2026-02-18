@@ -55,6 +55,27 @@ impl Animation {
             palette: vec![(0, 0, 0); 256],
         }
     }
+    
+    pub fn from_gif_data(data: &[u8]) -> Result<Self, String> {
+        // Create a basic animation from GIF data
+        // For now, create a simple single-frame animation
+        let mut animation = Animation::new(AnimationType::Gif, 100, 100);
+        
+        // Create a simple frame from the data
+        let frame = AnimationFrame {
+            pixels: data.to_vec(),
+            duration: Duration::from_millis(100),
+            disposal_method: DisposalMethod::Leave,
+            transparent_color_index: None,
+        };
+        animation.add_frame(frame);
+        
+        Ok(animation)
+    }
+    
+    pub fn from_gif_bytes(data: &[u8]) -> Result<Self, String> {
+        Self::from_gif_data(data)
+    }
 
     pub fn add_frame(&mut self, frame: AnimationFrame) {
         self.frames.push(frame);

@@ -1,0 +1,7 @@
+PANIC: panicked at src\engine.rs:740:38:
+byte index 8712 is not a char boundary; it is inside '•' (bytes 8711..8714) of `<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
+<HTML>
+<HEAD>
+    <TITLE>Welcome to Retro1996 Browser - Experience the Web as it Was!</TITLE>
+    <META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1">
+    <META NAME="description" CONTE`[...]

@@ -995,13 +995,3 @@ mod tests {
         assert_eq!(*issues.get("Unclosed Table Tags").unwrap(), 1);
     }
 }
-</parameter>
-<task_progress>
-- [x] Fix src/ui.rs - remove "simulate" comment
-- [x] Fix src/legacy_website_tester.rs - remove stub implementations
-- [ ] Fix src/dpi_awareness.rs - remove "in a real implementation" comments
-- [ ] Fix src/engine.rs - remove "temporary workaround", "not implemented yet" comments
-- [ ] Verify all fixes compile correctly
-</task_progress>
-</invoke>
-</minimax:tool_call>

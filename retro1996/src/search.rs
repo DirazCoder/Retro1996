@@ -191,12 +191,17 @@ impl PageSearcher {
                 return None;
             }
             
-            // Move to next result
+            // Move to next result with proper bounds checking
             let current_idx = session.current_result_index.unwrap_or(0);
+            if current_idx >= session.results.len() {
+                session.current_result_index = Some(0);
+                return session.results.first().cloned();
+            }
+            
             let next_idx = (current_idx + 1) % session.results.len();
             session.current_result_index = Some(next_idx);
             
-            Some(session.results[next_idx].clone())
+            session.results.get(next_idx).cloned()
         } else {
             None
         }
@@ -208,12 +213,21 @@ impl PageSearcher {
                 return None;
             }
             
-            // Move to previous result
+            // Move to previous result with proper bounds checking
             let current_idx = session.current_result_index.unwrap_or(0);
-            let prev_idx = if current_idx == 0 { session.results.len() - 1 } else { current_idx - 1 };
+            if current_idx == 0 {
+                let last_idx = session.results.len().saturating_sub(1);
+                session.current_result_index = Some(last_idx);
+                return session.results.get(last_idx).cloned();
+            } else if current_idx > session.results.len() {
+                session.current_result_index = Some(0);
+                return session.results.first().cloned();
+            }
+            
+            let prev_idx = current_idx - 1;
             session.current_result_index = Some(prev_idx);
             
-            Some(session.results[prev_idx].clone())
+            session.results.get(prev_idx).cloned()
         } else {
             None
         }

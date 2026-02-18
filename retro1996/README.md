@@ -190,14 +190,12 @@ Retro1996 captures this spirit of creativity and exploration.
 ### System Requirements
 
 **Minimum**:
-- Windows 10/11
 - 1 GHz processor
 - 512 MB RAM
 - 100 MB disk space
 - Graphics card with 32 MB VRAM
 
 **Recommended**:
-- Windows 10/11
 - 2 GHz processor
 - 2 GB RAM
 - 500 MB disk space

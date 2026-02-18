@@ -1,16 +1,12 @@
 use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use std::fs;
-use std::path::Path;
 use std::io::{self, Write, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::env;
-use std::net::TcpStream;
+use std::time::UNIX_EPOCH;
 
-#[derive(Debug, Clone)]
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum ErrorType {
     NotFound,
     ServerError,
@@ -242,6 +238,7 @@ impl ErrorPageFactory {
             context.error_type.title(),
             error_code,
             context.error_type.title(),
+            context.error_type.description(),
             context.url,
             context.error_message,
             timestamp_str,
@@ -513,6 +510,7 @@ impl ErrorPage {
             self.code.title(),
             error_code,
             self.code.title(),
+            self.code.description(),
             self.url,
             self.code.description(),
             timestamp_str,
@@ -581,7 +579,7 @@ impl AboutPages {
         let last_updated = Self::get_welcome_page_last_updated();
         
         // Read the base welcome.html template
-        let base_html = include_str!("../../assets/welcome.html");
+        let base_html = include_str!("../assets/welcome.html");
         
         // Replace dynamic placeholders
         let html_with_dynamic_content = base_html

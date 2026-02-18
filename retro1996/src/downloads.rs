@@ -121,23 +121,24 @@ impl DownloadManager {
         let active_downloads = self.active_downloads.clone();
         let downloads_ref = self.downloads.clone();
         let max_concurrent = self.max_concurrent_downloads;
+        let id_owned = id.to_string();  // Clone to owned String for 'static lifetime
 
         std::thread::spawn(move || {
             let mut active_lock = active_downloads.lock().unwrap();
             if active_lock.len() >= max_concurrent {
                 let mut downloads = downloads_ref.lock().unwrap();
-                if let Some(item) = downloads.get_mut(&id) {
+                if let Some(item) = downloads.get_mut(&id_owned) {
                     item.status = DownloadStatus::Queued;
                 }
                 return;
             }
-            active_lock.push(id.to_string());
+            active_lock.push(id_owned.clone());
             drop(active_lock);
 
-            let result = DownloadManager::perform_download(id, downloads_ref.clone());
+            let result = DownloadManager::perform_download(&id_owned, downloads_ref.clone());
             
             let mut active_lock = active_downloads.lock().unwrap();
-            active_lock.retain(|x| x != id);
+            active_lock.retain(|x| x != &id_owned);
         });
 
         Ok(())

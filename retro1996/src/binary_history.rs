@@ -381,7 +381,7 @@ impl BinaryHistoryManager {
             
             let transition_type_str = read_string(&mut file)
                 .map_err(|e| format!("Failed to read transition type: {}", e))?;
-            let transition_type = TransitionType::from(&transition_type_str);
+            let transition_type = TransitionType::from(transition_type_str.as_str());
 
             let entry = HistoryEntry {
                 url,

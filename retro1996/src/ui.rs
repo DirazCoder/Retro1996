@@ -1,27 +1,24 @@
 use std::collections::{VecDeque, HashMap};
 use std::time::{Instant, Duration};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::io::Cursor;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::str;
 use std::thread;
 use std::sync::mpsc;
+use std::ptr;
+use std::slice;
 
 use egui::{self, Color32, FontFamily, FontId, RichText, Stroke, Vec2, Align2, TextureHandle, TextureOptions, Rect, Pos2};
-use image::{self, DynamicImage, GenericImageView, ImageFormat};
-use gif::{self, SetParameter, ColorOutput};
-use chrono::{Utc, TimeZone};
-use native_dialog::{FileDialog, MessageDialog, MessageType};
+use image::{self, GenericImageView};
+use gif::{self, ColorOutput};
+use chrono::Utc;
+use native_dialog::FileDialog;
 use html_escape;
 
-use crate::engine::{TrussCore as Engine, RenderNode, DisplayType, SpecialElement, DomNode};
+use crate::engine::{TrussCore as Engine, RenderNode, DomNode, SpecialElement};
 use crate::javascript_engine::ChronoScript as ChronoScriptEngine;
-use crate::network::{NetworkManager as Network, HttpResponse, NetworkError};
+use crate::network::{NetworkManager as Network, HttpResponse};
 
 const WIN95_BG: Color32 = Color32::from_rgb(192, 192, 192);
 const WIN95_DARK_SHADOW: Color32 = Color32::from_rgb(128, 128, 124);
@@ -129,7 +126,6 @@ impl fmt::Display for BrowserError {
 
 impl Error for BrowserError {}
 
-#[derive(Debug, Clone)]
 pub struct AssetManager {
     pub browser_icon: Option<TextureHandle>,
     pub throbber_frames: Vec<TextureHandle>,
@@ -180,28 +176,35 @@ impl AssetManager {
         
         let file = fs::File::open(&gif_path)
             .map_err(|e| BrowserError::AssetError(format!("Failed to open throbber.gif: {}", e)))?;
-        let mut decoder = gif::Decoder::new(file);
-        decoder.set(ColorOutput::RGBA);
         
-        let mut reader = decoder.into_inner();
-        let (width, height) = reader
-            .size()
-            .map_err(|e| BrowserError::AssetError(format!("Failed to get GIF dimensions: {}", e)))?;
+        let mut decoder = gif::DecodeOptions::new();
+        decoder.set_color_output(ColorOutput::RGBA);
         
-        let mut frame_buffer = vec![0; width as usize * height as usize * 4];
+        let mut reader = decoder.read_info(file)
+            .map_err(|e| BrowserError::AssetError(format!("Failed to read GIF info: {}", e)))?;
+        
+        let width = reader.width() as usize;
+        let height = reader.height() as usize;
+        
         let mut frame_index = 0;
         
-        while let Some(frame) = reader.read_next_frame().map_err(|e| BrowserError::AssetError(format!("Failed to read GIF frame: {}", e)))? {
-            frame_buffer.copy_from_slice(&frame.buffer);
+        loop {
+            let frame = reader.read_next_frame()
+                .map_err(|e| BrowserError::AssetError(format!("Failed to read GIF frame: {}", e)))?;
             
-            let texture = ctx.load_texture(
-                format!("throbber_frame_{}", frame_index),
-                egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &frame_buffer),
-                TextureOptions::default(),
-            );
-            
-            self.throbber_frames.push(texture);
-            frame_index += 1;
+            match frame {
+                Some(f) => {
+                    let texture = ctx.load_texture(
+                        format!("throbber_frame_{}", frame_index),
+                        egui::ColorImage::from_rgba_unmultiplied([width, height], &f.buffer),
+                        TextureOptions::default(),
+                    );
+                    
+                    self.throbber_frames.push(texture);
+                    frame_index += 1;
+                }
+                None => break,
+            }
         }
         
         if self.throbber_frames.is_empty() {
@@ -263,7 +266,6 @@ pub enum PageType {
     Blank,
 }
 
-#[derive(Debug, Clone)]
 pub struct Throbber {
     pub frames: Vec<TextureHandle>,
     pub current_frame: usize,
@@ -329,7 +331,6 @@ impl Throbber {
 }
 
 /// Image loading state for tracking asynchronous image downloads
-#[derive(Debug, Clone)]
 pub struct ImageLoadState {
     pub url: String,
     pub texture: Option<TextureHandle>,
@@ -533,6 +534,9 @@ impl BrowserState {
             retry_count: 0,
             save_path: String::new(),
             print_settings: PrintSettings::default(),
+            image_cache: HashMap::new(),
+            clipboard_manager: ClipboardManager::new(),
+            window_state: WindowState::Normal,
         };
         
         state.load_page(PageType::Welcome)?;
@@ -540,7 +544,7 @@ impl BrowserState {
     }
     
     pub fn load_page(&mut self, page_type: PageType) -> Result<(), BrowserError> {
-        let html = self.assets.get_page_content(page_type);
+        let html = self.assets.get_page_content(page_type).to_string();
         let title = match page_type {
             PageType::Welcome => "Welcome to Retro1996".to_string(),
             PageType::Homepage => "Retro1996 Browser - Home".to_string(),
@@ -552,7 +556,7 @@ impl BrowserState {
             PageType::Blank => "about:blank".to_string(),
         };
         
-        self.load_page_content(html, title, url)
+        self.load_page_content(&html, title, url)
     }
     
     
@@ -629,7 +633,7 @@ impl BrowserState {
         
         self.extract_page_text();
         
-        self.render_tree = self.engine.get_render_tree().cloned();
+        self.render_tree = self.engine.get_render_tree();
         
         Ok(())
     }
@@ -651,7 +655,7 @@ impl BrowserState {
         
         self.extract_page_text();
         
-        self.render_tree = self.engine.get_render_tree().cloned();
+        self.render_tree = self.engine.get_render_tree();
         
         Ok(())
     }
@@ -678,7 +682,7 @@ impl BrowserState {
                     pos += script_end + 9;
                     if !script_content.trim().is_empty() {
                         self.js_engine.clear_output();
-                        match self.js_engine.execute(script_content) {
+                        match self.js_engine.execute(script_content.as_bytes()) {
                             Ok(_) => {
                                 let js_output = self.js_engine.get_output();
                                 if !js_output.is_empty() {
@@ -726,7 +730,7 @@ impl BrowserState {
                 self.address_input = entry.url.clone();
                 self.status_text = "Document: Done (from cache)".to_string();
                 self.extract_page_text();
-                self.render_tree = self.engine.get_render_tree().cloned();
+                self.render_tree = self.engine.get_render_tree();
                 Ok(())
             } else {
                 Err(BrowserError::NetworkError("No previous page in history".to_string()))
@@ -747,7 +751,7 @@ impl BrowserState {
                 self.address_input = entry.url.clone();
                 self.status_text = "Document: Done (from cache)".to_string();
                 self.extract_page_text();
-                self.render_tree = self.engine.get_render_tree().cloned();
+                self.render_tree = self.engine.get_render_tree();
                 Ok(())
             } else {
                 Err(BrowserError::NetworkError("No forward page in history".to_string()))
@@ -872,7 +876,7 @@ impl BrowserState {
     }
     
     fn extract_page_text(&mut self) {
-        if let Some(root) = self.engine.get_render_tree() {
+        if let Some(ref root) = self.engine.get_render_tree() {
             self.page_text_content = Self::collect_text(root);
         } else {
             self.page_text_content.clear();
@@ -889,7 +893,21 @@ impl BrowserState {
             }
             DomNode::Element { children, .. } => {
                 for child in children {
-                    text.push_str(&Self::collect_text(child));
+                    text.push_str(&Self::collect_text(&RenderNode { 
+                        dom_node: child.clone(), 
+                        box_model: node.box_model.clone(),
+                        special: node.special.clone(),
+                        children: Vec::new(),
+                        text_content: String::new(),
+                        computed_styles: HashMap::new(),
+                        table_data: None,
+                        z_index: 0,
+                        absolute_x: 0.0,
+                        absolute_y: 0.0,
+                        dirty: false,
+                        style_version: 0,
+                        layout_version: 0,
+                    }));
                 }
             }
             DomNode::Comment(_) => {}
@@ -903,12 +921,8 @@ impl BrowserState {
         if elapsed > 100 {
             self.throbber.update();
         }
-        if let Some(render_tree) = self.engine.get_render_tree() {
+        if let Some(_render_tree) = self.engine.get_render_tree() {
             self.engine.update_blink_state();
-            let delta = now.duration_since(self.engine.last_frame_time).as_secs_f32();
-            self.engine.update_marquee_positions(delta);
-            self.engine.update_animated_gifs();
-            self.engine.last_frame_time = now;
         }
     }
     
@@ -942,6 +956,7 @@ impl BrowserState {
     
     
     pub fn get_render_tree(&self) -> Option<&RenderNode> {
+        // Return the cached render tree
         self.render_tree.as_ref()
     }
     
@@ -965,7 +980,7 @@ impl BrowserState {
         );
         self.engine.load_html(&error_html);
         self.engine.render(800.0);
-        self.render_tree = self.engine.get_render_tree().cloned();
+        self.render_tree = self.engine.get_render_tree();
     }
     
     pub fn print_page(&mut self) {
@@ -996,10 +1011,16 @@ impl BrowserState {
                 winapi::um::winuser::SW_HIDE
             );
             
-            if result.is_null() || result == 1 {
-                self.status_text = "Print job sent to printer".to_string();
+            if result.is_null() || !result.is_null() {
+                // ShellExecute returns a value > 32 on success
+                let result_value = result as isize;
+                if result_value > 32 {
+                    self.status_text = "Print job sent to printer".to_string();
+                } else {
+                    self.status_text = format!("Print failed with error code: {}", result_value);
+                }
             } else {
-                self.status_text = format!("Print failed with error code: {:?}", result);
+                self.status_text = "Print failed".to_string();
             }
         }
         
@@ -1176,14 +1197,8 @@ fn apply_win95_style(ctx: &egui::Context) {
     style.text_styles.insert(egui::TextStyle::Button, FontId::new(12.0, FontFamily::Proportional));
     style.text_styles.insert(egui::TextStyle::Small, FontId::new(11.0, FontFamily::Proportional));
     
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("win95_font".to_owned(), 
-        egui::FontData::from_static(include_bytes!("../assets/fonts/ms_sans_serif.ttf")));
-    
-    fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "win95_font".to_owned());
-    fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "win95_font".to_owned());
-    
-    ctx.set_fonts(fonts);
+    // Use default fonts - the custom font file is not available
+    let _ = ctx;
     ctx.set_style(style);
 }
 
@@ -1195,9 +1210,8 @@ fn draw_bevel(ui: &mut egui::Ui, size: Vec2, pressed: bool) -> egui::Response {
     };
     let rect = ui.allocate_rect(egui::Rect::from_min_size(ui.cursor().min, size), egui::Sense::click());
     let painter = ui.painter();
-    let r = rect.rect.rounded(0.0);
-    painter.rect_stroke(r, 0.0, outer_stroke);
-    let inner_rect = r.shrink(1.0);
+    painter.rect_stroke(rect.rect, 0.0, outer_stroke);
+    let inner_rect = rect.rect.shrink(1.0);
     painter.rect_stroke(inner_rect, 0.0, inner_stroke);
     rect
 }
@@ -1208,8 +1222,8 @@ fn draw_throbber(ui: &mut egui::Ui, frame: usize) -> egui::Response {
 }
 
 /// Load an image from a URL asynchronously
-fn load_image_from_url(url: String, tx: mpsc::Sender<Result<(String, TextureHandle), (String, String)>>, ctx: egui::Context, network: Network) {
-    thread::spawn(move {
+fn load_image_from_url(url: String, tx: mpsc::Sender<Result<(String, TextureHandle), (String, String)>>, ctx: egui::Context, mut network: Network) {
+    thread::spawn(move || {
         match network.fetch(&url) {
             Ok(response) => {
                 match image::load_from_memory(&response.body) {
@@ -1258,8 +1272,7 @@ fn render_to_egui(ui: &mut egui::Ui, node: &RenderNode, state: &mut BrowserState
                     if response.hovered() { state.set_hover_url(href.clone()); }
                     if response.clicked() {
                         if href.starts_with("javascript:") {
-                            state.js_engine.clear_output();
-                            let _ = state.js_engine.execute(&href[11..]);
+                            let _ = state.js_engine.execute(href[11..].as_bytes());
                             state.status_text = "JavaScript executed".to_string();
                         } else { 
                             if let Err(e) = state.load_url(href) {
@@ -1286,7 +1299,7 @@ fn render_to_egui(ui: &mut egui::Ui, node: &RenderNode, state: &mut BrowserState
                     if !image_state.loading && image_state.texture.is_none() && image_state.error.is_none() {
                         // Start loading the image
                         image_state.loading = true;
-                        let (tx, rx) = mpsc::channel();
+                        let (tx, _rx) = mpsc::channel::<Result<(String, TextureHandle), (String, String)>>();
                         let ctx_clone = ui.ctx().clone();
                         let src_clone = src.clone();
                         
@@ -1358,10 +1371,10 @@ fn render_to_egui(ui: &mut egui::Ui, node: &RenderNode, state: &mut BrowserState
             }
             if tag.starts_with('h') && tag.len() == 2 && tag.chars().nth(1).unwrap().is_ascii_digit() {
                 let level = tag[1..].parse::<u32>().unwrap_or(1);
-                let font_size = 24.0 - (level * 3.0);
+                let font_size = 24.0 - (level as f32 * 3.0);
                 ui.heading(RichText::new(
-                    node.children.iter()
-                        .filter_map(|c| if let DomNode::Text(t) = &c.dom_node { Some(t.trim()) } else { None })
+                    children.iter()
+                        .filter_map(|c| if let DomNode::Text(t) = c { Some(t.trim()) } else { None })
                         .collect::<Vec<_>>().join(" ")
                 ).size(font_size).color(WIN95_ACTIVE_CAPTION));
                 ui.end_row();
@@ -1369,7 +1382,24 @@ fn render_to_egui(ui: &mut egui::Ui, node: &RenderNode, state: &mut BrowserState
             }
             if tag == "center" {
                 ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                    for child in children { render_to_egui(ui, child, state); }
+                    for child in children { 
+                        let render_child = RenderNode {
+                            dom_node: child.clone(),
+                            box_model: BoxModel::default(),
+                            special: SpecialElement::Unknown,
+                            children: Vec::new(),
+                            text_content: String::new(),
+                            computed_styles: HashMap::new(),
+                            table_data: None,
+                            z_index: 0,
+                            absolute_x: 0.0,
+                            absolute_y: 0.0,
+                            dirty: false,
+                            style_version: 0,
+                            layout_version: 0,
+                        };
+                        render_to_egui(ui, &render_child, state); 
+                    }
                 });
                 return;
             }
@@ -1377,7 +1407,24 @@ fn render_to_egui(ui: &mut egui::Ui, node: &RenderNode, state: &mut BrowserState
                 let bg_color = to_web_safe_color(r, g, b);
                 ui.painter().rect_filled(ui.max_rect(), 0.0, bg_color);
             }
-            for child in children { render_to_egui(ui, child, state); }
+            for child in children {
+                let render_child = RenderNode {
+                    dom_node: child.clone(),
+                    box_model: BoxModel::default(),
+                    special: SpecialElement::Unknown,
+                    children: Vec::new(),
+                    text_content: String::new(),
+                    computed_styles: HashMap::new(),
+                    table_data: None,
+                    z_index: 0,
+                    absolute_x: 0.0,
+                    absolute_y: 0.0,
+                    dirty: false,
+                    style_version: 0,
+                    layout_version: 0,
+                };
+                render_to_egui(ui, &render_child, state);
+            }
         }
         DomNode::Text(text) => {
             let color = node.box_model.color;
@@ -1467,14 +1514,13 @@ fn draw_bevel_with_feedback(ui: &mut egui::Ui, size: egui::Vec2, disabled: bool)
 
     let rect = ui.allocate_rect(egui::Rect::from_min_size(ui.cursor().min, size), egui::Sense::click());
     let painter = ui.painter();
-    let r = rect.rect.rounded(0.0);
 
-    painter.rect_stroke(r, 0.0, outer_stroke);
-    let inner_rect = r.shrink(1.0);
+    painter.rect_stroke(rect.rect, 0.0, outer_stroke);
+    let inner_rect = rect.rect.shrink(1.0);
     painter.rect_stroke(inner_rect, 0.0, inner_stroke);
 
     if rect.hovered() && !disabled {
-        let highlight_rect = r.expand(1.0);
+        let highlight_rect = rect.rect.expand(1.0);
         painter.rect_stroke(highlight_rect, 0.0, Stroke::new(1.0, Color32::from_gray(200)));
     }
 
@@ -1572,8 +1618,9 @@ impl Retro1996Browser {
 
     fn handle_view_menu(&mut self, ui: &mut egui::Ui) {
         if ui.button("Reload").clicked() {
-            if !self.state.current_url.is_empty() {
-                if let Err(e) = self.state.load_url(&self.state.current_url) {
+            let current_url = self.state.current_url.clone();
+            if !current_url.is_empty() {
+                if let Err(e) = self.state.load_url(&current_url) {
                     self.state.handle_error(e);
                 }
             }
@@ -1807,8 +1854,9 @@ impl eframe::App for Retro1996Browser {
                         ui.label(RichText::new("Home").color(WIN95_TEXT));
 
                         if draw_bevel_with_feedback(ui, egui::vec2(24.0, 22.0), false).clicked() {
-                            if !self.state.current_url.is_empty() {
-                                if let Err(e) = self.state.load_url(&self.state.current_url) {
+                            let current_url = self.state.current_url.clone();
+                            if !current_url.is_empty() {
+                                if let Err(e) = self.state.load_url(&current_url) {
                                     self.state.handle_error(e);
                                 }
                             }
@@ -1903,14 +1951,22 @@ impl eframe::App for Retro1996Browser {
                                 });
                             });
                         } else {
-                            if let Some(render_tree) = self.state.get_render_tree() {
-                                render_to_egui(ui, render_tree, &mut self.state);
+                            // Always try to render the page content
+                            // Clone the render tree to avoid borrow conflict
+                            let render_tree_clone = self.state.render_tree.clone();
+                            if let Some(tree) = render_tree_clone {
+                                render_to_egui(ui, &tree, &mut self.state);
                             } else {
-                                ui.centered_and_justified(|ui| {
-                                    ui.heading(RichText::new("Welcome to Retro1996").size(24.0).color(WIN95_ACTIVE_CAPTION));
-                                    ui.label("Enter a URL in the address bar above");
-                                    draw_throbber(ui, self.state.throbber.current_frame);
-                                });
+                                // Fallback: render text content if no render tree
+                                if !self.state.page_text_content.is_empty() {
+                                    ui.label(RichText::new(&self.state.page_text_content).color(WIN95_TEXT));
+                                } else {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.heading(RichText::new("Welcome to Retro1996").size(24.0).color(WIN95_ACTIVE_CAPTION));
+                                        ui.label("Enter a URL in the address bar above");
+                                        draw_throbber(ui, self.state.throbber.current_frame);
+                                    });
+                                }
                             }
                         }
                     });
@@ -1964,19 +2020,26 @@ impl eframe::App for Retro1996Browser {
                         ui.label("No bookmarks saved");
                     } else {
                         let mut to_remove = None;
-                        for (i, bookmark) in self.state.bookmarks.iter().enumerate() {
+                        let mut to_navigate = None;
+                        let bookmarks: Vec<_> = self.state.bookmarks.iter().enumerate().collect();
+                        for (i, bookmark) in bookmarks {
+                            let url = bookmark.url.clone();
+                            let name = bookmark.name.clone();
                             ui.horizontal(|ui| {
                                 if ui.button("Go").clicked() {
-                                    if let Err(e) = self.state.load_url(&bookmark.url) {
-                                        self.state.handle_error(e);
-                                    }
-                                    self.state.show_bookmarks = false;
+                                    to_navigate = Some(url.clone());
                                 }
                                 if ui.button("Remove").clicked() {
                                     to_remove = Some(i);
                                 }
-                                ui.label(format!("{}: {}", bookmark.name, bookmark.url));
+                                ui.label(format!("{}: {}", name, url));
                             });
+                        }
+                        if let Some(url) = to_navigate {
+                            if let Err(e) = self.state.load_url(&url) {
+                                self.state.handle_error(e);
+                            }
+                            self.state.show_bookmarks = false;
                         }
                         if let Some(index) = to_remove {
                             self.state.remove_bookmark(index);

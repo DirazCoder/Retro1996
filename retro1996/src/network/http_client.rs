@@ -73,8 +73,11 @@ impl HttpClient {
         self.tcp_client.send(request.as_bytes())
             .map_err(|e| format!("Send failed: {}", e))?;
 
+        // Read the full response - headers first, then body
         let mut response_buffer = Vec::new();
-        let mut buffer = [0; 1024];
+        let mut buffer = [0; 4096];
+        
+        // Read until we get the header terminator
         loop {
             let bytes_read = self.tcp_client.receive(&mut buffer)
                 .map_err(|e| format!("Receive failed: {}", e))?;
@@ -87,16 +90,32 @@ impl HttpClient {
                 break;
             }
         }
-
-        let response_str = String::from_utf8_lossy(&response_buffer);
-        let parts: Vec<&str> = response_str.split("\r\n\r\n").collect();
         
-        let header_section = parts[0];
-        let body = if parts.len() > 1 {
-            parts[1].as_bytes().to_vec()
+        // Find header/body boundary
+        let header_end = response_buffer.windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or("No header terminator found".to_string())?;
+        
+        // Extract header section as string
+        let header_section = String::from_utf8_lossy(&response_buffer[..header_end]).to_string();
+        
+        // Get any body data that came with the headers
+        let mut body = if response_buffer.len() > header_end + 4 {
+            response_buffer[header_end + 4..].to_vec()
         } else {
             Vec::new()
         };
+        
+        // Continue reading the rest of the body until connection closes
+        // (HTTP/1.0 with Connection: close)
+        loop {
+            let bytes_read = self.tcp_client.receive(&mut buffer)
+                .map_err(|e| format!("Receive failed: {}", e))?;
+            if bytes_read == 0 {
+                break; // Connection closed by server
+            }
+            body.extend_from_slice(&buffer[..bytes_read]);
+        }
 
         let header_lines: Vec<&str> = header_section.lines().collect();
         let status_line = header_lines[0];
@@ -170,8 +189,11 @@ impl HttpClient {
         self.tcp_client.send(request.as_bytes())
             .map_err(|e| format!("Send failed: {}", e))?;
 
+        // Read the full response - headers first, then body
         let mut response_buffer = Vec::new();
-        let mut buffer = [0; 1024];
+        let mut buffer = [0; 4096];
+        
+        // Read until we get the header terminator
         loop {
             let bytes_read = self.tcp_client.receive(&mut buffer)
                 .map_err(|e| format!("Receive failed: {}", e))?;
@@ -184,16 +206,32 @@ impl HttpClient {
                 break;
             }
         }
-
-        let response_str = String::from_utf8_lossy(&response_buffer);
-        let parts: Vec<&str> = response_str.split("\r\n\r\n").collect();
         
-        let header_section = parts[0];
-        let body = if parts.len() > 1 {
-            parts[1].as_bytes().to_vec()
+        // Find header/body boundary
+        let header_end = response_buffer.windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or("No header terminator found".to_string())?;
+        
+        // Extract header section as string
+        let header_section = String::from_utf8_lossy(&response_buffer[..header_end]).to_string();
+        
+        // Get any body data that came with the headers
+        let mut body = if response_buffer.len() > header_end + 4 {
+            response_buffer[header_end + 4..].to_vec()
         } else {
             Vec::new()
         };
+        
+        // Continue reading the rest of the body until connection closes
+        // (HTTP/1.0 with Connection: close)
+        loop {
+            let bytes_read = self.tcp_client.receive(&mut buffer)
+                .map_err(|e| format!("Receive failed: {}", e))?;
+            if bytes_read == 0 {
+                break; // Connection closed by server
+            }
+            body.extend_from_slice(&buffer[..bytes_read]);
+        }
 
         let header_lines: Vec<&str> = header_section.lines().collect();
         let status_line = header_lines[0];

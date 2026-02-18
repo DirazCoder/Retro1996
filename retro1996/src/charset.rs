@@ -219,10 +219,7 @@ impl EntityDecoder {
         result
     }
 
-    fn parse_entity<I>(&self, chars: &mut I) -> String 
-    where 
-        I: Iterator<Item = char>
-    {
+    fn parse_entity(&self, chars: &mut std::iter::Peekable<impl Iterator<Item = char>>) -> String {
         let mut entity = String::new();
         let mut numeric = false;
         let mut hex = false;

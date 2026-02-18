@@ -217,10 +217,10 @@ impl BookmarkManager {
         self.bookmarks.get_mut(id)
     }
 
-    pub fn get_folder(&self, id: &str) -> Option<&BookmarkFolder> {
+    pub fn get_folder(&self, id: &str) -> Option<BookmarkFolder> {
         if let Some(bookmark) = self.bookmarks.get(id) {
             if bookmark.is_folder {
-                let folder = BookmarkFolder {
+                return Some(BookmarkFolder {
                     id: bookmark.id.clone(),
                     name: bookmark.name.clone(),
                     description: bookmark.description.clone(),
@@ -228,8 +228,7 @@ impl BookmarkManager {
                     date_modified: bookmark.date_modified,
                     parent_folder: bookmark.parent_folder.clone(),
                     expanded: false,
-                };
-                return Some(folder.clone());
+                });
             }
         }
         None
