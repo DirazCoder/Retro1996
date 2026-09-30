@@ -1,3 +1,16 @@
+> [!WARNING]
+> **DO NOT USE THIS. SERIOUSLY.**
+>
+> This is absolute garbage. None of the buttons you see in those menus actually work — they either do nothing or just crash the browser. I would not even bother reading any of this. If I had to rate it, I'd give it a -10/10, because it's AI-generated garbage text I used back then. That's why you should never use very small, lightweight AI models — they always screw up.
+>
+> It takes like 30 seconds to even load the browser window. Embarrassing, right?
+>
+> The project has almost none of the features listed below — not all of them, but most. This project is **100% deprecated, unmaintained**, and likely has security holes. If that scares you, don't touch it.
+>
+> **Go to my C# project instead: [https://github.com/dirazcoder/retro96](https://github.com/dirazcoder/retro96) — you'll like that one way, way better than this one.**
+
+---
+
 # Retro1996 Browser
 
 ## Experience the Web as it Was Meant to Be in 1996

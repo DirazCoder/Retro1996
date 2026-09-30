@@ -16,7 +16,7 @@ use chrono::Utc;
 use native_dialog::FileDialog;
 use html_escape;
 
-use crate::engine::{TrussCore as Engine, RenderNode, DomNode, SpecialElement};
+use crate::engine::{TrussCore as Engine, RenderNode, DomNode, SpecialElement, BoxModel};
 use crate::javascript_engine::ChronoScript as ChronoScriptEngine;
 use crate::network::{NetworkManager as Network, HttpResponse};
 
@@ -150,7 +150,9 @@ impl AssetManager {
         };
         
         assets.load_browser_icon(ctx)?;
-        assets.load_throbber_gif(ctx)?;
+        if let Err(e) = assets.load_throbber_gif(ctx) {
+            eprintln!("Warning: throbber animation unavailable: {}", e);
+        }
         assets.load_html_pages()?;
         
         Ok(assets)
@@ -211,6 +213,7 @@ impl AssetManager {
             return Err(BrowserError::AssetError("No frames found in throbber.gif".to_string()));
         }
         
+        
         Ok(())
     }
     
@@ -219,16 +222,16 @@ impl AssetManager {
         let welcome_path = self.base_path.join("assets").join("welcome.html");
         let homepage_path = self.base_path.join("assets").join("homepage.html");
         let blank_path = self.base_path.join("assets").join("blank.html");
-        
+
         self.welcome_page = fs::read_to_string(welcome_path)
-            .map_err(|e| BrowserError::AssetError(format!("Failed to load welcome.html: {}", e)))?;
-        
+            .unwrap_or_else(|_| "<html><body><h1>Retro1996</h1><p>Welcome page not found.</p></body></html>".to_string());
+
         self.homepage = fs::read_to_string(homepage_path)
-            .map_err(|e| BrowserError::AssetError(format!("Failed to load homepage.html: {}", e)))?;
-        
+            .unwrap_or_else(|_| "<html><body><h1>Retro1996</h1><p>Homepage not found.</p></body></html>".to_string());
+
         self.blank_page = fs::read_to_string(blank_path)
-            .map_err(|e| BrowserError::AssetError(format!("Failed to load blank.html: {}", e)))?;
-        
+            .unwrap_or_else(|_| "<html><body></body></html>".to_string());
+
         Ok(())
     }
     
