@@ -7,6 +7,14 @@
 >
 > The project has almost none of the features listed below — not all of them, but most. This project is **100% deprecated, unmaintained**, and likely has security holes. If that scares you, don't touch it.
 >
+> A comprehensive test by an independent AI determined the full extent of what this browser can render:
+>
+> ```
+> text
+> ```
+>
+> Yea, it can only render very simple text thats it, if you dont believe my 20/20 vision, go check it for yourself.
+>
 > **Go to my C# project instead: [https://github.com/dirazcoder/retro96](https://github.com/dirazcoder/retro96) — you'll like that one way, way better than this one.**
 
 ---
